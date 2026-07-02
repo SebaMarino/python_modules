@@ -170,7 +170,8 @@ def cartesian_from_orbelement(a,e,inc, Omega, pomega, M):
         
 def cartesian_from_orbelement_rotating_frame(a,e,inc, Omega, pomega, M, alpha):
     # alpha is the rotating angle which needs to be subtracted from x and y
-    r, f= M_to_r(M, a, e )
+
+    r, f= M_to_r(M, a, e ) # M_to_r() accepts arrays
     arg_peri=pomega-Omega
     x=r* ((np.cos(Omega)*np.cos(arg_peri+f)) -  (np.sin(Omega)*np.sin(arg_peri+f)*np.cos(inc))  )
     y=r* ((np.sin(Omega)*np.cos(arg_peri+f)) +  (np.cos(Omega)*np.sin(arg_peri+f)*np.cos(inc))  )
@@ -312,17 +313,22 @@ def Tdomain(path_sim):  # for REBOUND
     file_0.close()
     return Ti,Tf,NT,dT, Nplt, Nsmall
 
+def Tdomain_any(path_sim, file='body_1.txt'):  # for REBOUND
+    # extract epochs from body_1.txt
+    epochs=np.loadtxt(path_sim+file, skiprows=1, usecols=(0,), delimiter=',')
+
+    return epochs
 
 
-def load_particles(path_sim, Npart, Tp, dTaverage, delimiter=',' , rotframe=False):
+def load_particles(path_sim, Npart, Tp=None, dTaverage=0, delimiter=',' , rotframe=False):
     print("loading particles from "+path_sim)
     # returns numpy array with list of x y de-rotated positions of
     # Npart particles between ti and tf
 
     # FIRST, LOAD SIMULATION PARAMETERS
-
     Ti,Tf,Nt,dT,Nplt, Nsmall=Tdomain(path_sim)
-
+  
+        
     if Npart>Nsmall: 
         print("error, Npart> simulated particles")
         sys.exit()
@@ -419,7 +425,77 @@ def load_particles(path_sim, Npart, Tp, dTaverage, delimiter=',' , rotframe=Fals
     return Particles
 
 
+def load_particles_all_epochs(path_sim, Npart, delimiter=',' , rotframe=False, planetfile='body_1.txt'):
+    print("loading particles from "+path_sim)
+    # load all epochs of Npart (like load_particles but for all epochs, not just a time of interest)
 
+    
+    # First, get time array and number of planets
+
+    epochs=Tdomain_any(path_sim, file=planetfile)
+    Nt=len(epochs)
+
+    # get number of planets by opening parameter file
+    path_file=path_sim+'parameters_run.out'
+    # read lines and search line starting with Nplanets and Nparticles
+    with open(path_file,'r') as file_0:
+        for i,line in enumerate(file_0):
+            dat=line.split()
+            if dat[0]=='Nplanets':
+                Nplt=int(dat[2])
+            elif dat[0]=='Nparticles':
+                Nsmall=int(dat[2])
+    
+    if Npart>Nsmall:
+        print("error, Npart> simulated particles")
+
+    # Second, LOAD ORB ELEMENTS OF PLANET TO DE-ROTATE WITH RESPECT ITS POSITION
+    Alphas=np.zeros(Nt)
+    if rotframe:
+
+        # load planet orbital elements e, M, pomega to calculate pomega and f
+        planet=np.loadtxt(path_sim+planetfile, skiprows=1, delimiter=',', usecols=(2, 5, 6))
+        Nti=len(planet)
+        eps=planet[:,0]
+        pomegas=planet[:,1]
+        Mps=planet[:,2]
+        fs=M_to_f_array(Mps,eps)
+        Alphas[:Nti]=pomegas+fs
+    
+        
+
+    # Second, LOAD ORB ELEMENTS OF PARTICLES AND DE-ROTATE THEIR X AND Y
+
+    Particles=np.zeros((Npart, Nt, 9)) # t, x, y,z, a_0, a, e, i
+    for i1 in range(Npart):
+
+        # load particle i1
+        parti=np.loadtxt(path_sim+'body_'+str(i1+Nplt+1)+'.txt', skiprows=1, delimiter=',')
+
+        Nti=len(parti) # check number of epochs for this particle as it could have been lost
+
+        a0=parti[0,1] # initial semi-major axis
+        epochs=parti[:,0]
+        aps=parti[:,1]
+        eps=parti[:,2]
+        incs=parti[:,3]*np.pi/180.0 # rad
+        Omegas=parti[:,4]*np.pi/180.0 # rad
+        pomegas=parti[:,5]*np.pi/180.0 # rad
+        Mps=parti[:,6]*np.pi/180.0 # rad
+
+        x,y,z=cartesian_from_orbelement_rotating_frame(aps,eps,incs, Omegas, pomegas, Mps, Alphas)
+
+        Particles[i1, :Nti, 0]= epochs
+        Particles[i1, :Nti, 1]= x
+        Particles[i1, :Nti, 2]= y
+        Particles[i1, :Nti, 3]= z
+        Particles[i1, :Nti, 4]= a0
+        Particles[i1, :Nti, 5]= aps
+        Particles[i1, :Nti, 6]= eps
+        Particles[i1, :Nti, 7]= incs
+        Particles[i1, :Nti, 8]= pomegas
+
+    return Particles
 
 
 
@@ -674,63 +750,61 @@ def load_particles_spread_rotframe(path_sim, Npart, Tp, Nspread,  delimiter=',',
     return Particles
 
 
-def load_planets(path_sim,  rot_frame=True, delimiter=','):
+def load_planets(path_sim,  rot_frame=True, delimiter=',', timesampling='linear'):
 
-    Ti,Tf,NT,dT, Nplt, Nsmall= Tdomain(path_sim)
+ 
+    epochs=Tdomain_any(path_sim, file='body_1.txt')
+    NT=len(epochs)
+    # get number of planets by opening parameter file
+    path_file=path_sim+'parameters_run.out'
+    # read lines and search line starting with Nplanets and Nparticles
+    with open(path_file,'r') as file_0:
+        for i,line in enumerate(file_0):
+            dat=line.split()
+            if dat[0]=='Nplanets':
+                Nplt=int(dat[2])
+
 
     Particles=np.zeros((Nplt,NT,  9)) # t, x, y,z, a_0, a, e, i, M
     Alphas=np.zeros(NT)
     for i1 in range(Nplt):
 
-        filei=open(path_sim+'body_'+str(i1+1)+'.txt', 'r')
-        filei.readline()
-        a0i= float(filei.readline().split(delimiter)[1])
+        # load using numpy.loadtxt
+        planeti=np.loadtxt(path_sim+'body_'+str(i1+1)+'.txt', skiprows=1, delimiter=',')
+        a0i= planeti[0,1]
 
-        filei.seek(0)
-        filei.readline() # header
+        # check how many epochs to save. Sometimes a planet is lost and the file is shorter than NT
+        Nti=len(planeti)
 
-        for i2 in range(NT):
+        epochs=planeti[:,0]
+        aps=planeti[:,1]
+        eps=planeti[:,2]
+        incs=planeti[:,3]*np.pi/180.0 # rad
+        Omegas=planeti[:,4]*np.pi/180.0 # rad
+        pomegas=planeti[:,5]*np.pi/180.0 # rad
+        Mps=planeti[:,6]*np.pi/180.0 # rad
+        Masses=planeti[:,7] # earth masses
+      
+        if i1==0:
+            fs= M_to_f_array(Mps,eps)
+            alphas=pomegas+fs
+            Alphas[:Nti]=alphas
 
-            dat=filei.readline().split(delimiter)
-            if len(dat)>1:
-                ti =float(dat[0])
-                ai =float(dat[1])
-                ei =float(dat[2])
-                inci =float(dat[3])*np.pi/180.0
-                Omegai =float(dat[4])*np.pi/180.0
-                pomegai =float(dat[5])*np.pi/180.0
-                Mi =float(dat[6])*np.pi/180.0
-                Massi =float(dat[7]) # earth masses
 
-            else:
-                ti = 0.0 
-                ai = 0.0 
-                ei = 0.0 
-                inci = 0.0
-                Omegai = 0.0 
-                pomegai = 0.0 
-                Mi = 0.0
-                Massi = 0.0 # earth masses
+        if rot_frame:
+            x,y,z=cartesian_from_orbelement_rotating_frame(aps,eps,incs, Omegas, pomegas, Mps, Alphas)
+        else:
+            x,y,z=cartesian_from_orbelement(aps,eps,incs, Omegas, pomegas, Mps)
 
-            if i1==0:
-                fi= M_to_f(Mi,ei)
-                alphai=pomegai+fi
-                Alphas[i2]=alphai
-
-            if rot_frame:
-                x,y,z=cartesian_from_orbelement_rotating_frame(ai,ei,inci, Omegai, pomegai, Mi, Alphas[i2])
-            else:
-                x,y,z=cartesian_from_orbelement(ai,ei,inci, Omegai, pomegai, Mi)
-
-            Particles[i1, i2, 0]= ti
-            Particles[i1, i2, 1]= x
-            Particles[i1, i2, 2]= y
-            Particles[i1, i2, 3]= z
-            Particles[i1, i2, 4]= a0i
-            Particles[i1, i2, 5]= ai
-            Particles[i1, i2, 6]= ei
-            Particles[i1, i2, 7]= inci
-            Particles[i1, i2, 8]= Massi
+        Particles[i1, :, 0]= epochs
+        Particles[i1, :, 1]= x
+        Particles[i1, :, 2]= y
+        Particles[i1, :, 3]= z
+        Particles[i1, :, 4]= a0i
+        Particles[i1, :, 5]= aps
+        Particles[i1, :, 6]= eps
+        Particles[i1, :, 7]= incs
+        Particles[i1, :, 8]= Masses
     return Particles
 
 
