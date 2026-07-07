@@ -457,13 +457,11 @@ def load_particles_all_epochs(path_sim, Npart, delimiter=',' , rotframe=False, p
         planet=np.loadtxt(path_sim+planetfile, skiprows=1, delimiter=',', usecols=(2, 5, 6))
         Nti=len(planet)
         eps=planet[:,0]
-        pomegas=planet[:,1]
-        Mps=planet[:,2]
+        pomegas=planet[:,1]*np.pi/180.0 # rad
+        Mps=planet[:,2]*np.pi/180.0 # rad
         fs=M_to_f_array(Mps,eps)
         Alphas[:Nti]=pomegas+fs
     
-        
-
     # Second, LOAD ORB ELEMENTS OF PARTICLES AND DE-ROTATE THEIR X AND Y
 
     Particles=np.zeros((Npart, Nt, 9)) # t, x, y,z, a_0, a, e, i
