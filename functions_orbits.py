@@ -326,28 +326,47 @@ def load_particles(path_sim, Npart, Tp=None, dTaverage=0, delimiter=',' , rotfra
     # Npart particles between ti and tf
 
     # FIRST, LOAD SIMULATION PARAMETERS
-    Ti,Tf,Nt,dT,Nplt, Nsmall=Tdomain(path_sim)
-  
-        
+    # Ti,Tf,Nt,dT,Nplt, Nsmall=Tdomain(path_sim)
+
+    epochs = Tdomain_any(path_sim)
+
+    # get number of planets by opening parameter file
+    path_file=path_sim+'parameters_run.out'
+    # read lines and search line starting with Nplanets and Nparticles
+    with open(path_file,'r') as file_0:
+        for i,line in enumerate(file_0):
+            dat=line.split()
+            if dat[0]=='Nplanets':
+                Nplt=int(dat[2])
+            elif dat[0]=='Nparticles':
+                Nsmall=int(dat[2])
+    
     if Npart>Nsmall: 
         print("error, Npart> simulated particles")
         sys.exit()
 
-    # check how many epochs to save (Ntaverage)
-    if Tp<Tf and dTaverage<=Tp:
-        Ntaverage=int(dTaverage*2/dT) +1
-    elif Tp==Tf and dTaverage<=Tp:
-        Ntaverage=int(dTaverage/dT) +1
-    elif Tp>Tf and Tp-dTaverage<Tf and dTaverage<=Tp:
-        Ntaverage=int((Tf-(Tp-dTaverage))/dT) +1
-    else: 
+    # check if Tp is within the range of epochs
+    if Tp<epochs[0] or Tp>epochs[-1]:
         print("error, epoch of interest does not overlay with simulation epochs")
         sys.exit()
 
-    Ni=int((Tp-dTaverage)/dT) # line where to start loading
-    print( Ni, Ntaverage)
+    # check epochs to average over
+    if dTaverage>0:
+        ids_average = np.where((epochs>=Tp-dTaverage) & (epochs<=Tp))[0]
+        Ntaverage=len(ids_average)
+    else:
+        # find the closest epoch to Tp
+        ids_average = np.argmin(np.abs(epochs - Tp))
+        Ntaverage=1
 
     # SECOND, LOAD ORB ELEMENTS OF PLANET TO DE-ROTATE WITH RESPECT ITS POSITION
+    print('ids average: ', ids_average)
+
+    # define Ni as the number of epochs to skip before reaching the epochs of interest
+    if hasattr(ids_average,"__len__"):
+        Ni=ids_average[0]
+    else:
+        Ni=ids_average
 
     Alphas=np.zeros(Ntaverage)
 
@@ -355,6 +374,8 @@ def load_particles(path_sim, Npart, Tp=None, dTaverage=0, delimiter=',' , rotfra
         filei=open(path_sim+'body_1.txt', 'r')
 
         filei.readline() # header
+
+        # read lines in for loop until the epoch of interest is reached
 
         for i2 in range(Ni):
             filei.readline()
