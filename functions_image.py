@@ -695,6 +695,58 @@ def load_fits(fits_path, rms=0., pbcor=False, output_unit=''):
 
     return ret_list
 
+#### load fits image (and primary beam) and extract its radial profile
+def radial_profile_fits_image(fits_path, fits_path_pb='', x0=0., y0=0., PA=0., inc=0., rmax=5., Nr=100, Nphi=100, rms=0., error_std=False, arcsec2=False, arc='elipse', rmin=0., wedge_width=0., ret_beam=False):
+
+    # fits_path is the path to the fits image
+    # fits_path_pb (optional) is the path to the primary beam image. If given, fits_path is assumed to be primary beam corrected
+    # arcsec2: if True, transform the image and rms from Jy/beam to Jy/arcsec2
+    # ret_beam: if True, also return BMAJ in arcsec
+    # the rest of the parameters are passed to radial_profile()
+
+    loaded=load_fits(fits_path, rms=rms)
+    xs, ys, xedge, yedge, image = loaded[:5]
+    ps_arcsec=abs(xs[1]-xs[0])
+    Npix=np.shape(image)[0]
+
+    if len(loaded)>5:
+        BMAJ, BMIN = loaded[8:10]
+    else:
+        BMAJ, BMIN = 0., 0.
+
+    if fits_path_pb!='':
+        pb=get_last2d(pyfits.open(fits_path_pb)[0].data)
+    else:
+        pb=np.ones((Npix,Npix))
+
+    if arcsec2:
+        beam_area=np.pi*BMAJ*BMIN/(4.*np.log(2.))
+        image=image/beam_area
+        rms=rms/beam_area
+        print('transforming to Jy/arcsec2')
+
+    Ir=radial_profile(image,
+                      image_pb=pb,
+                      x0=x0,
+                      y0=y0,
+                      PA=PA,
+                      inc=inc,
+                      rmax=rmax,
+                      Nr=Nr,
+                      Nphi=Nphi,
+                      rms=rms,
+                      BMAJ_arcsec=BMAJ,
+                      ps_arcsec=ps_arcsec,
+                      error_std=error_std,
+                      arc=arc,
+                      rmin=rmin,
+                      wedge_width=wedge_width)
+
+    if ret_beam:
+        return Ir, BMAJ
+    else:
+        return Ir
+
 #### load fits image with the option of trimming the field of view and increasing the resolution
 def fload_fits_image(path_image, path_pbcor='', rms=0., ps_final=0., XMAX=0., YMAX=0.0,  remove_star=False, output='', return_coordinates=False, centered=True, dpix=None): # for images from CASA
 
