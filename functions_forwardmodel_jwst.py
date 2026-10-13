@@ -620,6 +620,9 @@ def obj_fn(p, rdi_reduc, wdb, roi, distance, err_weighting=False, err_map=None, 
     p: lmfit.parameter.Parameters
         LMFit parameters object containing at least: r0_1, h0_1, ain_1, aout_1, pa_1, incl_1, g1_1, g2_1, wg1_1
         (or r0_1, fwhm_1, ... instead of ain_1, aout_1 if ring_model='Gaussian')
+        If p contains 'flux' (total disk flux in mJy), the raw model is normalized to that flux (as in lnprob_Nrings)
+        and the flux is fitted like any other parameter; the least-squares rescaling (lsq_sfac) is then not used
+        and sfac = 1. The F_i of the rings then only set their relative fluxes, so one of them must be fixed.
 
     ring_model: str
         Radial profile of each ring: '2PowerLaws' or 'Gaussian'. See grater_nring_2hg_disk_model.
@@ -677,8 +680,9 @@ def obj_fn(p, rdi_reduc, wdb, roi, distance, err_weighting=False, err_map=None, 
     
     lsq_sfac: bool
         If True, least-squares renormalize the brightness of the forward modeled disk image to match the data
-        within the region of interest (and considering the uncertainties when err_weighting is True). 
-        This should nearly always be True.
+        within the region of interest (and considering the uncertainties when err_weighting is True).
+        This should nearly always be True, unless the flux is fitted as a parameter ('flux' in p), in which case
+        it is ignored (no rescaling).
         
     count: bool
         If True, will advance and display a counter during the optimization. Requires setting 'counter = 0' somewhere
@@ -693,7 +697,13 @@ def obj_fn(p, rdi_reduc, wdb, roi, distance, err_weighting=False, err_map=None, 
         If True, clears the output every time the function is called. Mostly to prevent accumulating a large number 
         of print statements if the loop triggers a warning somewhere.
     """
-    pdict = p.valuesdict() 
+    pdict = p.valuesdict()
+
+    # Total disk flux (mJy) fitted as a parameter: normalize the raw model to it below instead of rescaling the
+    # forward model to the data by least squares
+    flux = pdict.pop('flux', None)
+    if flux is not None:
+        lsq_sfac = False
 
     # If the data is derotated, compare against the single north-up combined image (.im);
     # otherwise cycle through every roll simultaneously in its native detector-frame orientation (.rolls).
@@ -725,6 +735,11 @@ def obj_fn(p, rdi_reduc, wdb, roi, distance, err_weighting=False, err_map=None, 
                                             nx=wdb.nx, ny=wdb.ny, pxscale=wdb.pxscale,
                                             rmax_accuracy=rmax_accuracy, halfNbSlices=halfNbSlices, shared_params=shared_params,
                                             ring_model=ring_model)
+    if flux is not None:
+        # normalize the raw model (MJy/sr) to an integrated flux of 'flux' mJy, as in lnprob_Nrings
+        pix_sr = ((wdb.pxscale << u.rad/u.pixel).value)**2
+        raw_model /= np.sum(raw_model)*pix_sr
+        raw_model *= flux/1.0e9 # mJy -> MJy
 
     # Convolve the model using the prepared SpaceConvolution object then set it as the CSS model in the SpaceRDI object
     wdb.set_circumstellar_model(raw_model=raw_model, raw_model_pxscale=wdb.pxscale, raw_model_center=wdb.c_star)
@@ -794,7 +809,7 @@ def obj_fn(p, rdi_reduc, wdb, roi, distance, err_weighting=False, err_map=None, 
         
     if store_samples: # Append each set of paramaters and the corresponding chisq to a list
         chisq = np.nansum(res**2)
-        sample = [pdict[key] for key in pdict.keys()]
+        sample = list(p.valuesdict().values()) # all parameters, including 'flux' (popped from pdict above)
         sample.append(chisq)
         samples.append(sample)
         
