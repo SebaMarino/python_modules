@@ -270,10 +270,15 @@ def grater_nring_2hg_disk_model(cent=np.array([160.,160.]),
 
 
 
-def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, h0=0.05, gamma=2.0, err=None, wdb=None, shared_params=None, prior_ranges=None, halfNbSlices=2, return_soln=False, plot_model=False, print_chisq=False, backscattering=False, ring_model='2PowerLaws'):
+def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, h0=0.05, gamma=2.0, err=None, wdb=None, shared_params=None, prior_ranges=None, halfNbSlices=2, return_soln=False, plot_model=False, print_chisq=False, backscattering=False, ring_model='2PowerLaws', fm_cache=None):
     """
     parameters: [F, pa, incl, g1, (g2, wg1 if backscattering), r0_1, <ring params>_1, then for each extra ring: F_i, r0_i, <ring params>_i]
         where <ring params> are (ain, aout) for ring_model='2PowerLaws' or (fwhm,) for ring_model='Gaussian'.
+
+    fm_cache: dict or None
+        If given (fm_cache = precompute_fm_rdi(wdb), computed after setting the crop, zones and RDI presets used for
+        the fit), the forward-modeled RDI uses these precomputed reference-image quantities (fm_rdi_cached) instead of
+        wdb.run_rdi(forward_model=True), which is equivalent but faster. If None, wdb.run_rdi is used.
 
     raw_model:
         your idealized / unblurred disk model image oriented north-up.
@@ -285,6 +290,9 @@ def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, 
         the position where the star would be in the model image (zero indexed and as [x,y])
     """
     if wdb is None:
+        if fm_cache is not None:
+            raise ValueError("fm_cache was computed for a specific SpaceRDI object; pass that object as wdb.")
+        import winnie
         wdb = winnie.SpaceRDI(from_fits=rdi_reduc.filename)
     # else:
     #     wdbi=copy.deepcopy(wdb)  # Create a copy of the SpaceRDI object to avoid modifying the original one
@@ -295,57 +303,16 @@ def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, 
         wdb.set_crop(crop_size)
     # y1,y2,x1,x2 = wdb._crop_indices
 
-    ### extract common parameters
-    Fi, pai, incli, g1i = parameters[0:4]
-    if backscattering:
-        g2i, wg1i = parameters[4:6]
-        Nshared=6
-    else:
-        g2i=0
-        wg1i=1.0
-        Nshared=4
-
-    # per-ring radial parameters (after r0): ring 1 has [r0, *ring_keys], each extra ring has [F, r0, *ring_keys]
-    if ring_model == '2PowerLaws':
-        ring_keys = ['ain', 'aout']
-    elif ring_model == 'Gaussian':
-        ring_keys = ['fwhm']
-    else:
-        raise ValueError(f"Unknown ring_model '{ring_model}'; use '2PowerLaws' or 'Gaussian'.")
-    Nring1 = 1 + len(ring_keys)
-    Nextra = 2 + len(ring_keys)
-
-    pdict = {
-        'flux': Fi, # mJy
-        'pa': pai,
-        'incl': incli,
-        'h0': h0,
-        'gamma': gamma,
-        'g1': g1i,
-        'g2': g2i,
-        'wg1': wg1i,
-        'F_1': 1.0
-    }
-    for key, val in zip(['r0']+ring_keys, parameters[Nshared:Nshared+Nring1]):
-        pdict[f'{key}_1'] = val
-
-    # check how many extra rings are specified in the parameters by looking at the length of the parameters list
-    Nring_extra = (len(parameters) - (Nshared + Nring1)) / Nextra
-    if not Nring_extra.is_integer():
-        raise ValueError(f"The number of parameters for extra rings is not a multiple of {Nextra}. Each extra ring should have {Nextra} parameters: {', '.join(['F', 'r0']+ring_keys)}.")
-    Nring_extra = int(Nring_extra)
-    # populate pdict with the extra ring parameters
-    for i in range(Nring_extra):
-        start = Nshared + Nring1 + i*Nextra
-        for key, val in zip(['F', 'r0']+ring_keys, parameters[start:start+Nextra]):
-            pdict[f'{key}_{i+2}'] = val
+    ### extract disk parameters (shared parameters, then per-ring parameters)
+    pdict, Nrings = nring_parameters_to_pdict(parameters, h0=h0, gamma=gamma, backscattering=backscattering, ring_model=ring_model)
+    Fi = pdict['flux'] # mJy
 
     # apply priors
     if priors(pdict, prior_ranges=prior_ranges):
         return -np.inf  # Return negative infinity if any parameter is outside its prior range
 
     # require rings to be ordered by increasing r0 (avoids label switching between rings)
-    r0s = [pdict[f'r0_{i+1}'] for i in range(Nring_extra+1)]
+    r0s = [pdict[f'r0_{i+1}'] for i in range(Nrings)]
     if np.any(np.diff(r0s) <= 0):
         return -np.inf
     
@@ -374,7 +341,10 @@ def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, 
     wdb.set_circumstellar_model(raw_model=raw_model, raw_model_pxscale=wdb.pxscale, raw_model_center=wdb.c_star)
 
     # Run RDI on the model to get the forward-modeled result
-    fmrdi_reduc = wdb.run_rdi(forward_model=True, save_products=False, collapse_rolls=True, derotate=rdi_reduc.derotated, correct_distortion=rdi_reduc.distortion_corrected)
+    if fm_cache is None:
+        fmrdi_reduc = wdb.run_rdi(forward_model=True, save_products=False, collapse_rolls=True, derotate=rdi_reduc.derotated, correct_distortion=rdi_reduc.distortion_corrected)
+    else:
+        fmrdi_reduc = fm_rdi_cached(wdb, fm_cache, collapse_rolls=True, derotate=rdi_reduc.derotated, correct_distortion=rdi_reduc.distortion_corrected)
 
 
     if plot_model:
@@ -435,7 +405,7 @@ def promote_spacerdi_to_float64(wdb):
 def precompute_fm_rdi(wdb):
     """
     Precomputes the model-independent parts of forward-modeled RDI for the current crop, zones and RDI settings of
-    the winnie SpaceRDI object 'wdb'. The returned dictionary is used by fm_rdi_cached / lnprob_Nrings_cached, and must
+    the winnie SpaceRDI object 'wdb'. The returned dictionary is used by fm_rdi_cached (via lnprob_Nrings / obj_fn with fm_cache=...), and must
     be recomputed whenever the crop, zones or RDI presets of wdb change.
 
     Only supports the settings that are valid for forward modeling without smoothing (e.g. rdi_presets);
@@ -504,7 +474,7 @@ def fm_rdi_cached(wdb, fm_cache, derotate=False, correct_distortion=False, colla
 
 def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=False, ring_model='2PowerLaws'):
     """
-    Converts the parameter vector used by lnprob_Nrings / lnprob_Nrings_cached into a dictionary of disk parameters
+    Converts the parameter vector used by lnprob_Nrings into a dictionary of disk parameters
     (see lnprob_Nrings for the parameter order). Returns (pdict, Nrings).
     """
     Fi, pai, incli, g1i = parameters[0:4]
@@ -541,66 +511,8 @@ def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=Fal
     return pdict, Nring_extra+1
 
 
-def lnprob_Nrings_cached(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, h0=0.05, gamma=2.0, err=None, wdb=None,
-                         shared_params=None, prior_ranges=None, halfNbSlices=2, return_soln=False, plot_model=False,
-                         print_chisq=False, backscattering=False, ring_model='2PowerLaws', fm_cache=None):
-    """
-    Same as lnprob_Nrings, but the forward-modeled RDI uses the reference-only quantities precomputed with
-    fm_cache = precompute_fm_rdi(wdb) (computed after setting the crop, zones and RDI presets used for the fit).
-    """
-    if wdb is None or fm_cache is None:
-        raise ValueError("lnprob_Nrings_cached requires wdb and fm_cache = precompute_fm_rdi(wdb).")
-    if err is None:
-        err = 1
-    if crop_size is not None:
-        wdb.set_crop(crop_size)
-
-    pdict, Nrings = nring_parameters_to_pdict(parameters, h0=h0, gamma=gamma, backscattering=backscattering, ring_model=ring_model)
-    Fi = pdict['flux']
-
-    # apply priors
-    if priors(pdict, prior_ranges=prior_ranges):
-        return -np.inf
-
-    # require rings to be ordered by increasing r0 (avoids label switching between rings)
-    r0s = [pdict[f'r0_{i+1}'] for i in range(Nrings)]
-    if np.any(np.diff(r0s) <= 0):
-        return -np.inf
-
-    raw_model = grater_nring_2hg_disk_model(**pdict, cent=wdb.c_star, distance=distance,
-                                            nx=wdb.nx, ny=wdb.ny, pxscale=wdb.pxscale,
-                                            rmax_accuracy=None, halfNbSlices=halfNbSlices, shared_params=shared_params,
-                                            ring_model=ring_model)
-    # normalize raw_model to have an integrated flux of F_i (mJy -> MJy)
-    raw_model /= np.sum(raw_model)*pix_sr
-    raw_model *= (Fi/1.0e9)
-
-    wdb.set_circumstellar_model(raw_model=raw_model, raw_model_pxscale=wdb.pxscale, raw_model_center=wdb.c_star)
-    fmrdi_reduc = fm_rdi_cached(wdb, fm_cache, derotate=rdi_reduc.derotated, correct_distortion=rdi_reduc.distortion_corrected)
-
-    if plot_model:
-        pim = np.array([rdi_reduc.rolls[0], raw_model, fmrdi_reduc.rolls[0], rdi_reduc.rolls[0]-fmrdi_reduc.rolls[0]])
-        fig, (ax1,ax2, ax3, ax4) = quick_implot(np.where(roi, pim, np.nan), clim_perc=99., cmap='RdBu_r', show=False,
-                                   show_ticks=True, extent=rdi_reduc.extent)
-        ax1.set_title('Data')
-        ax2.set_title('Raw Model')
-        ax3.set_title('Forward Model')
-        ax4.set_title('Residuals')
-
-    chisq = np.sum(((rdi_reduc.rolls[0]-fmrdi_reduc.rolls[0])/err)[roi]**2)
-
-    if print_chisq:
-        dof = np.sum(roi) - len(parameters)
-        print(f"Chi2: {chisq:.1f}, dof: {dof}, reduced Chi2: {chisq/dof:.3f}")
-
-    if return_soln:
-        return raw_model, fmrdi_reduc, wdb
-
-    return -0.5 * chisq
-
-
 ## Parallel sampling (e.g. emcee with a pool of worker processes)
-# Each worker must have its own copy of the SpaceRDI object: lnprob_Nrings_cached modifies it on every call
+# Each worker must have its own copy of the SpaceRDI object: lnprob_Nrings modifies it on every call
 # (set_crop, set_circumstellar_model), so walkers sharing one object overwrite each other's model.
 # Passing wdb as an argument to emcee does not work well either: the pool pickles the arguments for every batch of
 # walkers. Instead, the arguments are stored at module level and inherited by worker processes created with the
@@ -612,7 +524,7 @@ _parallel_state = {}
 
 def set_parallel_lnprob(**kwargs):
     """
-    Stores the arguments of lnprob_Nrings_cached (everything except 'parameters', given as keywords, e.g.
+    Stores the arguments of lnprob_Nrings (everything except 'parameters', given as keywords, e.g.
     rdi_reduc=..., roi=..., distance=..., pix_sr=..., crop_size=..., wdb=..., fm_cache=..., ...) for use by
     lnprob_Nrings_parallel. Must be called before make_parallel_pool, since workers copy the state when created.
     """
@@ -621,8 +533,8 @@ def set_parallel_lnprob(**kwargs):
 
 
 def lnprob_Nrings_parallel(parameters):
-    """lnprob_Nrings_cached(parameters, **state), with state set by set_parallel_lnprob."""
-    return lnprob_Nrings_cached(parameters, **_parallel_state)
+    """lnprob_Nrings(parameters, **state), with state set by set_parallel_lnprob."""
+    return lnprob_Nrings(parameters, **_parallel_state)
 
 
 def _fork_blas_probe():
