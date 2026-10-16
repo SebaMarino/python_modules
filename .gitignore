@@ -4,3 +4,8 @@ Python_functions
 *.c
 *.so
 build
+__init__.py
+analysis_scripts.tar
+functions_gas_evol_0D_benchmark.py
+test1.py
+test2.py
