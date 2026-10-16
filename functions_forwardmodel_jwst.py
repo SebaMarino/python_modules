@@ -270,10 +270,15 @@ def grater_nring_2hg_disk_model(cent=np.array([160.,160.]),
 
 
 
-def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, h0=0.05, gamma=2.0, err=None, wdb=None, shared_params=None, prior_ranges=None, halfNbSlices=2, return_soln=False, plot_model=False, print_chisq=False, backscattering=False, ring_model='2PowerLaws', fm_cache=None):
+def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, h0=0.05, gamma=2.0, err=None, wdb=None, shared_params=None, prior_ranges=None, halfNbSlices=2, return_soln=False, plot_model=False, print_chisq=False, backscattering=False, ring_model='2PowerLaws', fm_cache=None, ref_ring=1):
     """
-    parameters: [F, pa, incl, g1, (g2, wg1 if backscattering), r0_1, <ring params>_1, then for each extra ring: F_i, r0_i, <ring params>_i]
-        where <ring params> are (ain, aout) for ring_model='2PowerLaws' or (fwhm,) for ring_model='Gaussian'.
+    parameters: [F, pa, incl, g1, (g2, wg1 if backscattering)], then for each ring i: [F_i, r0_i, <ring params>_i],
+        except the reference ring (ref_ring, default 1), whose F is fixed to 1 and left out: [r0_ref, <ring params>_ref].
+        <ring params> are (ain, aout) for ring_model='2PowerLaws' or (fwhm,) for ring_model='Gaussian'.
+        See nring_parameters_to_pdict.
+
+    ref_ring: int
+        The ring used as flux reference (F=1); the other rings' F are relative to it. Default 1.
 
     fm_cache: dict or None
         If given (fm_cache = precompute_fm_rdi(wdb), computed after setting the crop, zones and RDI presets used for
@@ -304,7 +309,7 @@ def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, 
     # y1,y2,x1,x2 = wdb._crop_indices
 
     ### extract disk parameters (shared parameters, then per-ring parameters)
-    pdict, Nrings = nring_parameters_to_pdict(parameters, h0=h0, gamma=gamma, backscattering=backscattering, ring_model=ring_model)
+    pdict, Nrings = nring_parameters_to_pdict(parameters, h0=h0, gamma=gamma, backscattering=backscattering, ring_model=ring_model, ref_ring=ref_ring)
     Fi = pdict['flux'] # mJy
 
     # apply priors
@@ -472,10 +477,15 @@ def fm_rdi_cached(wdb, fm_cache, derotate=False, correct_distortion=False, colla
                                   reduc_label=f'FM {wdb.reduc_label}', save_products=False)
 
 
-def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=False, ring_model='2PowerLaws'):
+def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=False, ring_model='2PowerLaws', ref_ring=1):
     """
-    Converts the parameter vector used by lnprob_Nrings into a dictionary of disk parameters
-    (see lnprob_Nrings for the parameter order). Returns (pdict, Nrings).
+    Converts the parameter vector used by lnprob_Nrings into a dictionary of disk parameters. Returns (pdict, Nrings).
+
+    Parameter order: [flux, pa, incl, g1, (g2, wg1 if backscattering)], then for each ring i = 1..N in order of
+    increasing radius: [F_i, r0_i, <ring params>_i], except for the reference ring (ref_ring), whose F is fixed to 1
+    and is therefore left out: [r0_ref, <ring params>_ref]. <ring params> are (ain, aout) for ring_model='2PowerLaws'
+    or (fwhm,) for ring_model='Gaussian'. With ref_ring=1 (default) the order is
+    [..., r0_1, <ring params>_1, F_2, r0_2, <ring params>_2, F_3, ...].
     """
     Fi, pai, incli, g1i = parameters[0:4]
     if backscattering:
@@ -492,23 +502,43 @@ def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=Fal
         ring_keys = ['fwhm']
     else:
         raise ValueError(f"Unknown ring_model '{ring_model}'; use '2PowerLaws' or 'Gaussian'.")
-    Nring1 = 1 + len(ring_keys)
-    Nextra = 2 + len(ring_keys)
+
+    # N rings take N*(1+len(ring_keys)) + (N-1) parameters (every ring but the reference one has an F)
+    Nrings = (len(parameters) - Nshared + 1) / (2 + len(ring_keys))
+    if not Nrings.is_integer():
+        raise ValueError(f"Wrong number of ring parameters: each ring needs {', '.join(['F', 'r0']+ring_keys)}, "
+                         f"except the reference ring (ref_ring={ref_ring}), which has no F.")
+    Nrings = int(Nrings)
+    if not 1 <= ref_ring <= Nrings:
+        raise ValueError(f"ref_ring={ref_ring} but the parameters describe {Nrings} ring(s).")
 
     pdict = {'flux': Fi, 'pa': pai, 'incl': incli, 'h0': h0, 'gamma': gamma,
-             'g1': g1i, 'g2': g2i, 'wg1': wg1i, 'F_1': 1.0}
-    for key, val in zip(['r0']+ring_keys, parameters[Nshared:Nshared+Nring1]):
-        pdict[f'{key}_1'] = val
+             'g1': g1i, 'g2': g2i, 'wg1': wg1i}
+    j = Nshared
+    for i in range(1, Nrings+1):
+        keys = ['r0']+ring_keys if i == ref_ring else ['F', 'r0']+ring_keys
+        for key, val in zip(keys, parameters[j:j+len(keys)]):
+            pdict[f'{key}_{i}'] = val
+        if i == ref_ring:
+            pdict[f'F_{i}'] = 1.0
+        j += len(keys)
+    return pdict, Nrings
 
-    Nring_extra = (len(parameters) - (Nshared + Nring1)) / Nextra
-    if not Nring_extra.is_integer():
-        raise ValueError(f"The number of parameters for extra rings is not a multiple of {Nextra}. Each extra ring should have {Nextra} parameters: {', '.join(['F', 'r0']+ring_keys)}.")
-    Nring_extra = int(Nring_extra)
-    for i in range(Nring_extra):
-        start = Nshared + Nring1 + i*Nextra
-        for key, val in zip(['F', 'r0']+ring_keys, parameters[start:start+Nextra]):
-            pdict[f'{key}_{i+2}'] = val
-    return pdict, Nring_extra+1
+
+def set_reference_ring(p, ref_ring):
+    """
+    For lmfit Parameters used with obj_fn: makes ring 'ref_ring' the flux reference by fixing F_<ref_ring> = 1
+    (vary=False) and letting the F of every other ring vary. Returns p (modified in place).
+    """
+    Fkeys = sorted([k for k in p if k.startswith('F_') and k[2:].isdigit()], key=lambda k: int(k[2:]))
+    if f'F_{ref_ring}' not in p:
+        raise ValueError(f"p has no F_{ref_ring}; rings found: {', '.join(Fkeys)}.")
+    for k in Fkeys:
+        if k == f'F_{ref_ring}':
+            p[k].set(value=1.0, vary=False)
+        else:
+            p[k].set(vary=True)
+    return p
 
 
 ## Parallel sampling (e.g. emcee with a pool of worker processes)
