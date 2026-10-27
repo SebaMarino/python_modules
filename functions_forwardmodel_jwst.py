@@ -203,6 +203,144 @@ def grater_gauss_2hg_disk_model(r0, fwhm, h0, pa, incl, g1, g2, wg1,
     return fix_star_cross(disk, cent)
 
 
+def tanh_gaps_profile(r, rmin, rmax, lin, lout, gamma_sd, gaps=()):
+    """
+    Radial profile of the 'TanhGaps' model (normalised so that Sigma_c = 1):
+        Sigma(r) = 1/4 (r/rmin)^gamma_sd (1+tanh[(r-rmin)/lin]) (1+tanh[(rmax-r)/lout]) * prod_k G_k(r),
+        G_k(r) = 1 - d_k exp(-0.5((r-r_k)/sigma_k)^2), sigma_k = fwhm_k/(2 sqrt(2 ln2)),
+    with gaps a sequence of (r_k, fwhm_k, d_k). r in the same units as rmin, rmax, lin, lout, r_k and fwhm_k.
+    """
+    r = np.asarray(r, dtype=float)
+    S = 0.25*np.power(r/rmin, gamma_sd)*(1.+np.tanh((r-rmin)/lin))*(1.+np.tanh((rmax-r)/lout))
+    for rg, fwhmg, dg in gaps:
+        sigg = fwhmg/(2.*np.sqrt(2.*np.log(2.)))
+        S = S*(1.-dg*np.exp(-0.5*((r-rg)/sigg)**2))
+    return S
+
+
+def gap_params_to_list(gap_params):
+    """Converts {'r_gap1':..., 'fwhm_gap1':..., 'd_gap1':..., 'r_gap2':...} into [(r_gap1, fwhm_gap1, d_gap1), ...]."""
+    gaps = []
+    k = 1
+    while f'r_gap{k}' in gap_params:
+        gaps.append((gap_params[f'r_gap{k}'], gap_params[f'fwhm_gap{k}'], gap_params[f'd_gap{k}']))
+        k += 1
+    return gaps
+
+
+class DustEllipticalDistributionTanhGaps:
+    """
+    Power-law disk with tanh inner and outer edges and Gaussian gaps (see tanh_gaps_profile), written as a drop-in
+    replacement for VIP's DustEllipticalDistribution2PowerLaws (as DustEllipticalDistributionGaussian).
+
+    The radial profile is evaluated at the semi-major axis a_eff = r*(1-e*cos(theta))/(1-e^2). The vertical profile
+    is exp(-(|z|/H)^gamma), with H = ksi0*(a_eff/rmin)^beta (ksi0 is the scale height at rmin).
+    If surface_density is True (default), the profile describes the surface density (the midplane density is divided
+    by H/ksi0); if False, it describes the midplane volume density.
+    """
+
+    def __init__(self, accuracy=1.e-3, density_dico={}):
+        self.accuracy = accuracy
+        self.set_density_distribution(density_dico)
+
+    def set_density_distribution(self, density_dico):
+        self.rmin = float(density_dico.get('rmin', 30.))
+        self.rmax_edge = float(density_dico.get('rmax', 80.))
+        self.lin = float(density_dico.get('lin', 5.))
+        self.lout = float(density_dico.get('lout', 5.))
+        self.gamma_sd = float(density_dico.get('gamma_sd', 0.))
+        self.gaps = list(density_dico.get('gaps', []))
+        self.e = float(np.clip(density_dico.get('e', 0.), 0., 0.99))
+        self.ksi0 = float(density_dico.get('ksi0', 1.))
+        self.gamma = float(density_dico.get('gamma', 2.))
+        self.beta = float(density_dico.get('beta', 1.))
+        self.surface_density = bool(density_dico.get('surface_density', True))
+
+        # Far from an edge, (1+tanh(x))/2 ~ exp(2x), so each edge drops below 'accuracy' at 0.5*ln(1/accuracy) l
+        nl = 0.5*np.log(1./self.accuracy)
+        self.amin = max(self.rmin - nl*self.lin, 0.)
+        self.amax = self.rmax_edge + nl*self.lout
+        # maximum distance from the star (apocentre of the outer edge) for the integration, AU
+        self.rmax = self.amax*(1.+self.e)
+        # maximum height for the integration, AU (evaluated at amax so the flared outer edge isn't truncated)
+        self.zmax = self.ksi0*(self.amax/self.rmin)**self.beta*(-np.log(self.accuracy))**(1./self.gamma)
+        self.itiltthreshold = np.rad2deg(np.arctan(self.rmax/self.zmax))
+
+    def density_cylindrical(self, r, costheta, z):
+        """Return the particle volume density at r, theta, z."""
+        a_eff = r*(1.-self.e*costheta)/(1.-self.e**2)
+        # avoid dividing by zero (and diverging power laws) for points passing (almost) through the star
+        a_safe = np.maximum(a_eff, max(self.amin, 1e-3*self.rmin))
+        radial_term = np.where(a_eff >= self.amin,
+                               tanh_gaps_profile(a_safe, self.rmin, self.rmax_edge, self.lin, self.lout,
+                                                 self.gamma_sd, self.gaps), 0.)
+        h_ratio = np.power(a_safe/self.rmin, self.beta)
+        if self.surface_density:
+            radial_term = radial_term/h_ratio
+        vertical_term = np.exp(-np.power(np.abs(z)/(self.ksi0*h_ratio), self.gamma))
+        return radial_term*vertical_term
+
+    def density_cartesian(self, x, y, z):
+        r = np.sqrt(x**2+y**2)
+        costheta = 0 if r == 0 else x/r
+        return self.density_cylindrical(r, costheta, z)
+
+    def print_info(self, pxInAu=None):
+        print('Type of structure: power law with tanh edges and Gaussian gaps')
+        print('rmin: {0:.2f} au (lin={1:.2f} au), rmax: {2:.2f} au (lout={3:.2f} au), gamma: {4:.2f}'.format(
+            self.rmin, self.lin, self.rmax_edge, self.lout, self.gamma_sd))
+        for k, (rg, fwhmg, dg) in enumerate(self.gaps):
+            print('Gap {0}: r={1:.2f} au, FWHM={2:.2f} au, depth={3:.2f}'.format(k+1, rg, fwhmg, dg))
+        print('Eccentricity: {0:.2f}'.format(self.e))
+        print('Scale height: {0:.2f} au at {1:.2f} au'.format(self.ksi0, self.rmin))
+        print('Maximum radius for integration: {0:.2f} au'.format(self.rmax))
+        print('Maximum height for integration: {0:.2f} au'.format(self.zmax))
+
+
+def grater_tanhgaps_2hg_disk_model(rmin, rmax, lin, lout, gamma_sd, h0, pa, incl, g1, g2, wg1,
+                                   e=0., omega=0., gamma=2., beta=1., xdo=0, ydo=0,
+                                   cent=np.array([160.,160.]), distance=10., nx=320, ny=320,
+                                   pxscale=0.063*u.arcsec/u.pixel, accuracy=None, rmax_accuracy=None,
+                                   halfNbSlices=25, polar=False, flux_max=1.0, surface_density=True,
+                                   **gap_params):
+    """
+    Same as grater_2hg_disk_model, but with the radial profile of tanh_gaps_profile: a power law (exponent
+    gamma_sd) between rmin and rmax with tanh edges of widths lin and lout (all in au), multiplied by Gaussian gaps.
+
+    gap_params: r_gap1, fwhm_gap1, d_gap1, r_gap2, ... (centre and FWHM in au, fractional depth 0-1) for each gap.
+    h0: ratio of scale height to radius at rmin
+    surface_density: if True, the profile is the surface density; if False, the midplane volume density
+    accuracy: the density is truncated where the edges drop below this fraction (default 1e-3)
+    rmax_accuracy: if not None, the integration is additionally truncated at this separation (in au)
+
+    All other parameters as in grater_2hg_disk_model.
+    """
+    if accuracy is None:
+        accuracy = 1e-3
+
+    spf = {'name':'DoubleHG', 'g': [g1, g2], 'weight': wg1, 'polar': polar}
+    dens = {'rmin': rmin, 'rmax': rmax, 'lin': lin, 'lout': lout, 'gamma_sd': gamma_sd,
+            'gaps': gap_params_to_list(gap_params), 'ksi0': h0*rmin, 'e': e, 'gamma': gamma, 'beta': beta,
+            'surface_density': surface_density}
+
+    # VIP only implements '2PowerLaws', so build the disk with a placeholder density and swap in ours
+    vip_disk = ScatteredLightDisk(nx=nx, ny=ny, distance=distance,
+                                  itilt=incl, pxInArcsec=(pxscale << u.arcsec/u.pixel).value,
+                                  pa=pa-180., omega=omega, xdo=xdo, ydo=ydo,
+                                  density_dico={'name': '2PowerLaws'}, spf_dico=spf, flux_max=flux_max,
+                                  xs=cent[0], ys=cent[1])
+
+    tanh_dens = DustEllipticalDistributionTanhGaps(accuracy, dens)
+    if rmax_accuracy is not None:
+        tanh_dens.rmax = min(tanh_dens.rmax, rmax_accuracy)
+    vip_disk.dust_density.accuracy = accuracy
+    vip_disk.dust_density.type = 'TanhGaps'
+    vip_disk.dust_density.dust_distribution_calc = tanh_dens
+    vip_disk.check_inclination = lambda: None # see dont_actually_check_inclination in grater_2hg_disk_model
+    disk = vip_disk.compute_scattered_light(halfNbSlices=halfNbSlices)
+    return fix_star_cross(disk, cent)
+
+
 def fix_star_cross(disk, cent):
     # For disks with material coincident with the stellar position along the line of sight, VIP returns an image with a plus-sign shaped region of zeros at the star's position
     # The below is a quick work-around to correct this. Very likely makes zero difference following PSF-convolution
@@ -275,6 +413,8 @@ def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, 
     parameters: [F, pa, incl, g1, (g2, wg1 if backscattering)], then for each ring i: [F_i, r0_i, <ring params>_i],
         except the reference ring (ref_ring, default 1), whose F is fixed to 1 and left out: [r0_ref, <ring params>_ref].
         <ring params> are (ain, aout) for ring_model='2PowerLaws' or (fwhm,) for ring_model='Gaussian'.
+        For ring_model='TanhGaps': [F, pa, incl, g1, (g2, wg1)], [rmin, rmax, lin, lout, gamma_sd], then
+        [r_gapk, fwhm_gapk, d_gapk] for each gap (shared_params and ref_ring are not used).
         See nring_parameters_to_pdict.
 
     ref_ring: int
@@ -316,19 +456,33 @@ def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, 
     if priors(pdict, prior_ranges=prior_ranges):
         return -np.inf  # Return negative infinity if any parameter is outside its prior range
 
-    # require rings to be ordered by increasing r0 (avoids label switching between rings)
-    r0s = [pdict[f'r0_{i+1}'] for i in range(Nrings)]
-    if np.any(np.diff(r0s) <= 0):
-        return -np.inf
+    if ring_model == 'TanhGaps':
+        # require rmin < rmax, gaps ordered by increasing radius (Nrings is the number of gaps here)
+        # and gaps narrower than their radius (fwhm_gap/r_gap < 1)
+        r_gaps = np.array([pdict[f'r_gap{k+1}'] for k in range(Nrings)])
+        fwhm_gaps = np.array([pdict[f'fwhm_gap{k+1}'] for k in range(Nrings)])
+        if pdict['rmin'] >= pdict['rmax'] or np.any(np.diff(r_gaps) <= 0) or np.any(fwhm_gaps >= r_gaps):
+            return -np.inf
+    else:
+        # require rings to be ordered by increasing r0 (avoids label switching between rings)
+        r0s = [pdict[f'r0_{i+1}'] for i in range(Nrings)]
+        if np.any(np.diff(r0s) <= 0):
+            return -np.inf
     
     # Generate the raw model oriented north-up
     # We generate a detector-sampled raw model, and then subpixelate it before PSF convolution
     # You could alter this to generate an oversampled model quite easily, but in my experience the
     # only difference is runtime.
-    raw_model = grater_nring_2hg_disk_model(**pdict, cent=wdb.c_star, distance=distance,
-                                            nx=wdb.nx, ny=wdb.ny, pxscale=wdb.pxscale,
-                                            rmax_accuracy=None, halfNbSlices=halfNbSlices, shared_params=shared_params,
-                                            ring_model=ring_model)
+    if ring_model == 'TanhGaps':
+        raw_model = grater_tanhgaps_2hg_disk_model(**{k: v for k, v in pdict.items() if k != 'flux'},
+                                                   cent=wdb.c_star, distance=distance,
+                                                   nx=wdb.nx, ny=wdb.ny, pxscale=wdb.pxscale,
+                                                   rmax_accuracy=None, halfNbSlices=halfNbSlices)
+    else:
+        raw_model = grater_nring_2hg_disk_model(**pdict, cent=wdb.c_star, distance=distance,
+                                                nx=wdb.nx, ny=wdb.ny, pxscale=wdb.pxscale,
+                                                rmax_accuracy=None, halfNbSlices=halfNbSlices, shared_params=shared_params,
+                                                ring_model=ring_model)
     # normalize raw_model to have an integrated flux of F_i
     
     # print raw flux
@@ -486,6 +640,10 @@ def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=Fal
     and is therefore left out: [r0_ref, <ring params>_ref]. <ring params> are (ain, aout) for ring_model='2PowerLaws'
     or (fwhm,) for ring_model='Gaussian'. With ref_ring=1 (default) the order is
     [..., r0_1, <ring params>_1, F_2, r0_2, <ring params>_2, F_3, ...].
+
+    For ring_model='TanhGaps' (a single power-law disk with tanh edges and Gaussian gaps, see tanh_gaps_profile),
+    the shared parameters are followed by [rmin, rmax, lin, lout, gamma_sd] and then [r_gapk, fwhm_gapk, d_gapk] for
+    each gap k = 1..Ngaps (ref_ring is ignored). Returns (pdict, Ngaps).
     """
     Fi, pai, incli, g1i = parameters[0:4]
     if backscattering:
@@ -496,12 +654,31 @@ def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=Fal
         wg1i = 1.0
         Nshared = 4
 
+    if ring_model == 'TanhGaps':
+        # a single disk [rmin, rmax, lin, lout, gamma_sd] followed by [r_gapk, fwhm_gapk, d_gapk] for each gap
+        disk_keys = ['rmin', 'rmax', 'lin', 'lout', 'gamma_sd']
+        gap_keys = ['r_gap', 'fwhm_gap', 'd_gap']
+        Ngaps = (len(parameters) - Nshared - len(disk_keys)) / len(gap_keys)
+        if Ngaps < 0 or not Ngaps.is_integer():
+            raise ValueError(f"Wrong number of parameters for ring_model='TanhGaps': the disk needs "
+                             f"{', '.join(disk_keys)}, and each gap {', '.join(gap_keys)}.")
+        Ngaps = int(Ngaps)
+        pdict = {'flux': Fi, 'pa': pai, 'incl': incli, 'h0': h0, 'gamma': gamma,
+                 'g1': g1i, 'g2': g2i, 'wg1': wg1i}
+        pdict.update(zip(disk_keys, parameters[Nshared:Nshared+len(disk_keys)]))
+        j = Nshared+len(disk_keys)
+        for k in range(1, Ngaps+1):
+            for key, val in zip(gap_keys, parameters[j:j+len(gap_keys)]):
+                pdict[f'{key}{k}'] = val
+            j += len(gap_keys)
+        return pdict, Ngaps
+
     if ring_model == '2PowerLaws':
         ring_keys = ['ain', 'aout']
     elif ring_model == 'Gaussian':
         ring_keys = ['fwhm']
     else:
-        raise ValueError(f"Unknown ring_model '{ring_model}'; use '2PowerLaws' or 'Gaussian'.")
+        raise ValueError(f"Unknown ring_model '{ring_model}'; use '2PowerLaws', 'Gaussian' or 'TanhGaps'.")
 
     # N rings take N*(1+len(ring_keys)) + (N-1) parameters (every ring but the reference one has an F)
     Nrings = (len(parameters) - Nshared + 1) / (2 + len(ring_keys))
