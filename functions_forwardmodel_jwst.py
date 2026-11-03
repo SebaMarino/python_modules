@@ -1,3 +1,4 @@
+import json
 import numpy as np
 from scipy import linalg
 
@@ -16,6 +17,7 @@ from astropy import convolution
 import stpsf
 from IPython.display import clear_output
 import astropy.units as u
+from spaceKLIP import starphot
 
 # Module-level counter used by obj_fn's progress display (see 'count' parameter).
 # 'global counter' inside obj_fn binds to this module's namespace, not the caller's,
@@ -1094,3 +1096,62 @@ def flip_xaxis(ax):
     ax.invert_xaxis()
     return ax
 
+
+
+def get_jwst_mag(sed, spec_type, instrument, filt, detector, exp_type):
+    """
+    Get the JWST magnitude of a star given its SED and spectral type.
+
+    Parameters
+    ----------
+    sed : str
+        Path to the stellar SED file (passed to starphot.get_stellar_magnitudes as starfile).
+    spec_type : str
+        Stellar spectral type.
+    instrument : str
+        JWST instrument in use, 'NIRCAM' or 'MIRI'.
+    filt : str
+        Filter name (e.g. 'F444W').
+    detector : str
+        Detector name (e.g. 'NRCALONG', 'NRCA1', 'MIRIMAGE').
+    exp_type : str
+        Exposure type from the FITS header (e.g. 'NRC_CORON', 'NRC_IMAGE',
+        'MIR_4QPM', 'MIR_LYOT', 'MIR_IMAGE').
+
+    Returns
+    -------
+    float
+        Stellar Vega magnitude in the requested filter.
+    """
+    # Stellar magnitudes (vegamag) in each filter of the JWST instrument in use.
+    primary_vegamag, _, _, _ = starphot.get_stellar_magnitudes(sed, spectral_type=spec_type, instrume=instrument,
+                                                               detector=detector, exp_type=exp_type)
+    # Return filter-specific magnitude
+    return primary_vegamag[filt]
+
+
+def format_SED_calcon(json_sed):
+    """
+    Format an SED from sdb (JSON) to use in spaceKLIP functions.
+
+    Writes a two-column text file (wavelength [micron], flux [Jy]) next to the
+    input file, with the .json extension replaced by .txt.
+
+    Parameters
+    ----------
+    json_sed : str
+        Path to the sdb SED JSON file.
+
+    Returns
+    -------
+    str
+        Path to the output text file.
+    """
+    with open(json_sed) as f:
+        sed_data = json.load(f)
+    w = sed_data['star_spec']['wavelength']  # microns
+    flux = sed_data['star_spec']['fnujy']  # Jy
+
+    file_path = json_sed.replace('.json', '.txt')
+    np.savetxt(file_path, np.column_stack([w, flux]))
+    return file_path
