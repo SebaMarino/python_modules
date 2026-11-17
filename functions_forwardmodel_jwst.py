@@ -13,6 +13,7 @@ from winnie.utils import (
     )
 import vip_hci as vip
 from vip_hci.fm import ScatteredLightDisk, Phase_function
+from vip_hci.fm.scattered_light_disk import DustEllipticalDistribution2PowerLaws
 from astropy import convolution
 import stpsf
 from IPython.display import clear_output
@@ -31,11 +32,52 @@ counter = 0
 
 # (we don't actually need more than 1 ring here — I just had the code already and thought it might be helpful for other applications)
 
+class DustEllipticalDistribution2PowerLawsEps(DustEllipticalDistribution2PowerLaws):
+    """
+    VIP's DustEllipticalDistribution2PowerLaws with a free smoothing exponent eps for the two power laws
+    (used by grater_2hg_disk_model when eps != 2, by swapping the class of VIP's own density object).
+
+    The radial profile is evaluated at the semi-major axis a_eff = r*(1-e*cos(theta))/(1-e^2), as in VIP:
+        rho_mid(a_eff) = dens_at_r0 * [2 / ((a_eff/r0)^(-eps*ain) + (a_eff/r0)^(-eps*aout))]^(1/eps)
+    eps = 2 is VIP's (GRaTer's, Augereau et al. 1999) prescription. A larger eps gives a sharper turnover between
+    the two slopes (a broken power law for eps -> inf), a smaller one a broader, rounder peak; the slopes far from
+    r0 are ain and aout for any eps. The vertical profile is VIP's: exp(-(|z|/H)^gamma), with H = ksi0*(a_eff/r0)^beta.
+
+    Everything else (rmax, zmax, e, amin, itiltthreshold) is VIP's. rmax only depends on aout, which sets the
+    slope at large radii for any eps. Note that VIP's print_info still computes the ring FWHM with eps = 2.
+    """
+    eps = 2.
+
+    def set_eps(self, eps):
+        """Set the smoothing exponent (> 0) and update the peak radii (as VIP does for eps = 2)."""
+        if not eps > 0:
+            raise ValueError(f'eps must be > 0 (got {eps}).')
+        self.eps = float(eps)
+        if self.ain != self.aout:
+            self.apeak = self.a*np.power(-self.ain/self.aout, 1./(self.eps*(self.ain-self.aout)))
+            Gamma_in, Gamma_out = self.ain+self.beta, self.aout+self.beta
+            self.apeak_surface_density = self.a*np.power(-Gamma_in/Gamma_out, 1./(self.eps*(Gamma_in-Gamma_out)))
+
+    def density_cylindrical(self, r, costheta, z):
+        """Return the particle volume density at r, theta, z (VIP's, with smoothing exponent eps)."""
+        radial_ratio = r/(self.p/(1-self.e*costheta))
+        with np.errstate(over='ignore', divide='ignore'): # r -> 0 or large eps: den -> inf, density -> 0
+            den = (np.power(radial_ratio, -self.eps*self.ain) +
+                   np.power(radial_ratio, -self.eps*self.aout))
+        radial_density_term = np.power(2./den, 1./self.eps)*self.dens_at_r0
+        if self.pmin > 0:
+            radial_density_term[r/(self.pmin/(1-self.e*costheta)) <= 1] = 0
+        den2 = (self.ksi0*np.power(radial_ratio, self.beta))
+        # Could change to np.exp(-1/2*np.power(np.abs(z)/den2, self.gamma)) for a Gaussian vertical profile, but that would be inconsistent with VIP's 2PowerLaws implementation.
+        vertical_density_term = np.exp(-np.power(np.abs(z)/den2, self.gamma))
+        return radial_density_term*vertical_density_term
+
+
 def grater_2hg_disk_model(r0, h0, ain, aout, pa, incl, g1, g2, wg1,
                           e=0., omega=0., gamma=2., beta=1., xdo=0, ydo=0,
                           cent=np.array([160.,160.]), distance=10., nx=320, ny=320,
                           pxscale=0.063*u.arcsec/u.pixel, accuracy=None, rmax_accuracy=None,
-                          halfNbSlices=25, polar=False, flux_max=1.0):
+                          halfNbSlices=25, polar=False, flux_max=1.0, eps=2.):
     """
     A simple ring-like disk morphology based on Augereau et al. (1999) and assuming a linear combo of two H-G SPFs as the scattering phase function.
 
@@ -52,6 +94,9 @@ def grater_2hg_disk_model(r0, h0, ain, aout, pa, incl, g1, g2, wg1,
     omega: argument of pericenter in degrees
     gamma: vertical density exponent (gamma = 2 for gaussian)
     beta: disk radial flaring exponent (beta = 1 for linear)
+    eps: smoothing exponent of the two power laws, rho_mid ∝ [(r/r0)^(-eps*ain) + (r/r0)^(-eps*aout)]^(-1/eps)
+         (must be > 0). eps = 2 (default) is VIP's / GRaTer's prescription and runs VIP's own code unchanged;
+         otherwise see DustEllipticalDistribution2PowerLawsEps.
 
     cent: the pixel position for the center of the disk (generally the location of the star in the data)
     distance: distance to the target in parsecs
@@ -91,6 +136,10 @@ def grater_2hg_disk_model(r0, h0, ain, aout, pa, incl, g1, g2, wg1,
 
     vip_disk.dust_density.accuracy = accuracy
     vip_disk.dust_density.dust_distribution_calc.rmax = vip_disk.dust_density.dust_distribution_calc.a*accuracy**(1/vip_disk.dust_density.dust_distribution_calc.aout)
+    if eps != 2:
+        # keep VIP's density object (rmax, zmax, e, amin) and only replace its radial profile by the eps one
+        vip_disk.dust_density.dust_distribution_calc.__class__ = DustEllipticalDistribution2PowerLawsEps
+        vip_disk.dust_density.dust_distribution_calc.set_eps(eps)
     vip_disk.check_inclination = dont_actually_check_inclination
     disk = vip_disk.compute_scattered_light(halfNbSlices=halfNbSlices)
     return fix_star_cross(disk, cent)
@@ -372,6 +421,9 @@ def grater_nring_2hg_disk_model(cent=np.array([160.,160.]),
                                  **disk_params):
     """
     ring_model: '2PowerLaws' (each ring needs r0_i, ain_i, aout_i) or 'Gaussian' (each ring needs r0_i, fwhm_i).
+    eps: optional smoothing exponent of the two power laws (ring_model='2PowerLaws' only, see grater_2hg_disk_model),
+        given per ring (eps_i in disk_params) or shared by all rings ('eps', treated as shared even if it is not in
+        shared_params). A ring with no eps uses eps = 2, i.e. the GRaTer model.
     """
     if ring_model == '2PowerLaws':
         ring_fn = grater_2hg_disk_model
@@ -379,6 +431,10 @@ def grater_nring_2hg_disk_model(cent=np.array([160.,160.]),
         ring_fn = grater_gauss_2hg_disk_model
     else:
         raise ValueError(f"Unknown ring_model '{ring_model}'; use '2PowerLaws' or 'Gaussian'.")
+
+    shared_params = list(shared_params) if shared_params is not None else []
+    if 'eps' in disk_params and 'eps' not in shared_params:
+        shared_params.append('eps')
 
     composite_image = np.zeros((ny,nx))
     all_rings_finished = False
@@ -398,6 +454,8 @@ def grater_nring_2hg_disk_model(cent=np.array([160.,160.]),
             for shared_pkey in shared_params:
                 if shared_pkey not in ring_params:
                     ring_params[shared_pkey] = disk_params[shared_pkey]
+            if ring_model != '2PowerLaws' and ring_params.pop('eps', 2.) != 2:
+                raise ValueError(f"eps (power-law smoothing) only applies to ring_model='2PowerLaws', not '{ring_model}'.")
             # obtain the flux scaling for this ring (default to 1 if not specified) and add the appropriately scaled ring model to the composite image
             F_i = ring_params.pop('F', 1)
             composite_image += F_i * ring_fn(**ring_params, cent=cent,
@@ -410,7 +468,7 @@ def grater_nring_2hg_disk_model(cent=np.array([160.,160.]),
 
 
 
-def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, h0=0.05, gamma=2.0, err=None, wdb=None, shared_params=None, prior_ranges=None, halfNbSlices=2, return_soln=False, plot_model=False, print_chisq=False, backscattering=False, ring_model='2PowerLaws', fm_cache=None, ref_ring=1):
+def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, h0=0.05, gamma=2.0, err=None, wdb=None, shared_params=None, prior_ranges=None, halfNbSlices=2, return_soln=False, plot_model=False, print_chisq=False, backscattering=False, ring_model='2PowerLaws', fm_cache=None, ref_ring=1, eps=2.0, fit_eps=False):
     """
     parameters: [F, pa, incl, g1, (g2, wg1 if backscattering)], then for each ring i: [F_i, r0_i, <ring params>_i],
         except the reference ring (ref_ring, default 1), whose F is fixed to 1 and left out: [r0_ref, <ring params>_ref].
@@ -421,6 +479,15 @@ def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, 
 
     ref_ring: int
         The ring used as flux reference (F=1); the other rings' F are relative to it. Default 1.
+
+    eps: float
+        Smoothing exponent of the two power laws, shared by all rings (ring_model='2PowerLaws' only, see
+        grater_2hg_disk_model). Used as a fixed value (like h0 and gamma) when fit_eps is False. Default 2 (GRaTer).
+
+    fit_eps: bool
+        If True, eps is sampled: it is an extra parameter placed right after the shared ones,
+        [F, pa, incl, g1, (g2, wg1), eps, ...] (see nring_parameters_to_pdict), and the eps argument is ignored.
+        Set its prior with prior_ranges, e.g. {'eps': (0.5, 20.)}; eps <= 0 always returns -inf. Default False.
 
     fm_cache: dict or None
         If given (fm_cache = precompute_fm_rdi(wdb), computed after setting the crop, zones and RDI presets used for
@@ -451,12 +518,15 @@ def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, 
     # y1,y2,x1,x2 = wdb._crop_indices
 
     ### extract disk parameters (shared parameters, then per-ring parameters)
-    pdict, Nrings = nring_parameters_to_pdict(parameters, h0=h0, gamma=gamma, backscattering=backscattering, ring_model=ring_model, ref_ring=ref_ring)
+    pdict, Nrings = nring_parameters_to_pdict(parameters, h0=h0, gamma=gamma, backscattering=backscattering, ring_model=ring_model, ref_ring=ref_ring,
+                                              eps=eps, fit_eps=fit_eps)
     Fi = pdict['flux'] # mJy
 
     # apply priors
     if priors(pdict, prior_ranges=prior_ranges):
         return -np.inf  # Return negative infinity if any parameter is outside its prior range
+    if pdict.get('eps', 2.) <= 0:
+        return -np.inf  # the power-law smoothing exponent must be positive
 
     if ring_model == 'TanhGaps':
         # require rmin < rmax, gaps ordered by increasing radius (Nrings is the number of gaps here)
@@ -633,7 +703,8 @@ def fm_rdi_cached(wdb, fm_cache, derotate=False, correct_distortion=False, colla
                                   reduc_label=f'FM {wdb.reduc_label}', save_products=False)
 
 
-def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=False, ring_model='2PowerLaws', ref_ring=1):
+def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=False, ring_model='2PowerLaws', ref_ring=1,
+                              eps=2.0, fit_eps=False):
     """
     Converts the parameter vector used by lnprob_Nrings into a dictionary of disk parameters. Returns (pdict, Nrings).
 
@@ -646,6 +717,12 @@ def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=Fal
     For ring_model='TanhGaps' (a single power-law disk with tanh edges and Gaussian gaps, see tanh_gaps_profile),
     the shared parameters are followed by [rmin, rmax, lin, lout, gamma_sd] and then [r_gapk, fwhm_gapk, d_gapk] for
     each gap k = 1..Ngaps (ref_ring is ignored). Returns (pdict, Ngaps).
+
+    eps and fit_eps (ring_model='2PowerLaws' only) set the smoothing exponent of the two power laws, shared by all
+    rings (see grater_2hg_disk_model). If fit_eps is False (default), eps is fixed to the given value like h0 and
+    gamma, and only added to pdict if eps != 2 (so that the default model is exactly the GRaTer one). If fit_eps is
+    True, eps is read from the parameter vector, right after the shared parameters:
+    [flux, pa, incl, g1, (g2, wg1 if backscattering), eps], then the rings as above.
     """
     Fi, pai, incli, g1i = parameters[0:4]
     if backscattering:
@@ -655,6 +732,12 @@ def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=Fal
         g2i = 0
         wg1i = 1.0
         Nshared = 4
+
+    if ring_model != '2PowerLaws' and (fit_eps or eps != 2):
+        raise ValueError(f"eps (power-law smoothing) only applies to ring_model='2PowerLaws', not '{ring_model}'.")
+    if fit_eps:
+        eps = parameters[Nshared]
+        Nshared += 1
 
     if ring_model == 'TanhGaps':
         # a single disk [rmin, rmax, lin, lout, gamma_sd] followed by [r_gapk, fwhm_gapk, d_gapk] for each gap
@@ -693,6 +776,8 @@ def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=Fal
 
     pdict = {'flux': Fi, 'pa': pai, 'incl': incli, 'h0': h0, 'gamma': gamma,
              'g1': g1i, 'g2': g2i, 'wg1': wg1i}
+    if fit_eps or eps != 2:
+        pdict['eps'] = eps # otherwise left out, so the model is exactly the GRaTer one
     j = Nshared
     for i in range(1, Nrings+1):
         keys = ['r0']+ring_keys if i == ref_ring else ['F', 'r0']+ring_keys
@@ -832,6 +917,9 @@ def obj_fn(p, rdi_reduc, wdb, roi, distance, err_weighting=False, err_map=None, 
         If p contains 'flux' (total disk flux in mJy), the raw model is normalized to that flux (as in lnprob_Nrings)
         and the flux is fitted like any other parameter; the least-squares rescaling (lsq_sfac) is then not used
         and sfac = 1. The F_i of the rings then only set their relative fluxes, so one of them must be fixed.
+        If p contains 'eps' (shared by all rings, e.g. p.add('eps', 2., min=0.5, max=20.)) or 'eps_i' (per ring),
+        it sets the smoothing exponent of the two power laws (ring_model='2PowerLaws' only, must be > 0, see
+        grater_2hg_disk_model). Without it, eps = 2, i.e. the GRaTer model.
 
     ring_model: str
         Radial profile of each ring: '2PowerLaws' or 'Gaussian'. See grater_nring_2hg_disk_model.
