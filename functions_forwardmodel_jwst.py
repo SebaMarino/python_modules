@@ -420,21 +420,18 @@ def grater_nring_2hg_disk_model(cent=np.array([160.,160.]),
                                  polar=False, halfNbSlices=25, shared_params=None, ring_model='2PowerLaws',
                                  **disk_params):
     """
-    ring_model: '2PowerLaws' (each ring needs r0_i, ain_i, aout_i) or 'Gaussian' (each ring needs r0_i, fwhm_i).
-    eps: optional smoothing exponent of the two power laws (ring_model='2PowerLaws' only, see grater_2hg_disk_model),
-        given per ring (eps_i in disk_params) or shared by all rings ('eps', treated as shared even if it is not in
-        shared_params). A ring with no eps uses eps = 2, i.e. the GRaTer model.
+    ring_model: '2PowerLaws' (each ring needs r0_i, ain_i, aout_i), '2PowerLawsEps' (same, plus the smoothing
+        exponent of the two power laws eps_i, see grater_2hg_disk_model; a ring with no eps_i uses eps = 2, i.e.
+        the GRaTer model) or 'Gaussian' (each ring needs r0_i, fwhm_i).
     """
-    if ring_model == '2PowerLaws':
+    if ring_model in ('2PowerLaws', '2PowerLawsEps'):
         ring_fn = grater_2hg_disk_model
     elif ring_model == 'Gaussian':
         ring_fn = grater_gauss_2hg_disk_model
     else:
-        raise ValueError(f"Unknown ring_model '{ring_model}'; use '2PowerLaws' or 'Gaussian'.")
+        raise ValueError(f"Unknown ring_model '{ring_model}'; use '2PowerLaws', '2PowerLawsEps' or 'Gaussian'.")
 
     shared_params = list(shared_params) if shared_params is not None else []
-    if 'eps' in disk_params and 'eps' not in shared_params:
-        shared_params.append('eps')
 
     composite_image = np.zeros((ny,nx))
     all_rings_finished = False
@@ -454,8 +451,8 @@ def grater_nring_2hg_disk_model(cent=np.array([160.,160.]),
             for shared_pkey in shared_params:
                 if shared_pkey not in ring_params:
                     ring_params[shared_pkey] = disk_params[shared_pkey]
-            if ring_model != '2PowerLaws' and ring_params.pop('eps', 2.) != 2:
-                raise ValueError(f"eps (power-law smoothing) only applies to ring_model='2PowerLaws', not '{ring_model}'.")
+            if ring_model != '2PowerLawsEps' and 'eps' in ring_params:
+                raise ValueError(f"eps (power-law smoothing) needs ring_model='2PowerLawsEps', not '{ring_model}'.")
             # obtain the flux scaling for this ring (default to 1 if not specified) and add the appropriately scaled ring model to the composite image
             F_i = ring_params.pop('F', 1)
             composite_image += F_i * ring_fn(**ring_params, cent=cent,
@@ -468,26 +465,22 @@ def grater_nring_2hg_disk_model(cent=np.array([160.,160.]),
 
 
 
-def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, h0=0.05, gamma=2.0, err=None, wdb=None, shared_params=None, prior_ranges=None, halfNbSlices=2, return_soln=False, plot_model=False, print_chisq=False, backscattering=False, ring_model='2PowerLaws', fm_cache=None, ref_ring=1, eps=2.0, fit_eps=False):
+def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, h0=0.05, gamma=2.0, err=None, wdb=None, shared_params=None, prior_ranges=None, halfNbSlices=2, return_soln=False, plot_model=False, print_chisq=False, backscattering=False, ring_model='2PowerLaws', fm_cache=None, ref_ring=1):
     """
     parameters: [F, pa, incl, g1, (g2, wg1 if backscattering)], then for each ring i: [F_i, r0_i, <ring params>_i],
         except the reference ring (ref_ring, default 1), whose F is fixed to 1 and left out: [r0_ref, <ring params>_ref].
-        <ring params> are (ain, aout) for ring_model='2PowerLaws' or (fwhm,) for ring_model='Gaussian'.
-        For ring_model='TanhGaps': [F, pa, incl, g1, (g2, wg1)], [rmin, rmax, lin, lout, gamma_sd], then
+        <ring params> are (ain, aout) for ring_model='2PowerLaws', (ain, aout, eps) for ring_model='2PowerLawsEps'
+        or (fwhm,) for ring_model='Gaussian'. For ring_model='TanhGaps': [F, pa, incl, g1, (g2, wg1)], [rmin, rmax, lin, lout, gamma_sd], then
         [r_gapk, fwhm_gapk, d_gapk] for each gap (shared_params and ref_ring are not used).
         See nring_parameters_to_pdict.
 
     ref_ring: int
         The ring used as flux reference (F=1); the other rings' F are relative to it. Default 1.
 
-    eps: float
-        Smoothing exponent of the two power laws, shared by all rings (ring_model='2PowerLaws' only, see
-        grater_2hg_disk_model). Used as a fixed value (like h0 and gamma) when fit_eps is False. Default 2 (GRaTer).
-
-    fit_eps: bool
-        If True, eps is sampled: it is an extra parameter placed right after the shared ones,
-        [F, pa, incl, g1, (g2, wg1), eps, ...] (see nring_parameters_to_pdict), and the eps argument is ignored.
-        Set its prior with prior_ranges, e.g. {'eps': (0.5, 20.)}; eps <= 0 always returns -inf. Default False.
+    ring_model: str
+        '2PowerLaws', '2PowerLawsEps', 'Gaussian' or 'TanhGaps'. With '2PowerLawsEps', each ring also has its own
+        smoothing exponent eps_i of the two power laws (see grater_2hg_disk_model; eps = 2 is '2PowerLaws'). Set its
+        prior with prior_ranges, e.g. {'eps_1': (0.5, 20.)}; eps_i <= 0 always returns -inf.
 
     fm_cache: dict or None
         If given (fm_cache = precompute_fm_rdi(wdb), computed after setting the crop, zones and RDI presets used for
@@ -518,15 +511,14 @@ def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, 
     # y1,y2,x1,x2 = wdb._crop_indices
 
     ### extract disk parameters (shared parameters, then per-ring parameters)
-    pdict, Nrings = nring_parameters_to_pdict(parameters, h0=h0, gamma=gamma, backscattering=backscattering, ring_model=ring_model, ref_ring=ref_ring,
-                                              eps=eps, fit_eps=fit_eps)
+    pdict, Nrings = nring_parameters_to_pdict(parameters, h0=h0, gamma=gamma, backscattering=backscattering, ring_model=ring_model, ref_ring=ref_ring)
     Fi = pdict['flux'] # mJy
 
     # apply priors
     if priors(pdict, prior_ranges=prior_ranges):
         return -np.inf  # Return negative infinity if any parameter is outside its prior range
-    if pdict.get('eps', 2.) <= 0:
-        return -np.inf  # the power-law smoothing exponent must be positive
+    if ring_model == '2PowerLawsEps' and any(pdict[f'eps_{i+1}'] <= 0 for i in range(Nrings)):
+        return -np.inf  # the power-law smoothing exponents must be positive
 
     if ring_model == 'TanhGaps':
         # require rmin < rmax, gaps ordered by increasing radius (Nrings is the number of gaps here)
@@ -703,26 +695,19 @@ def fm_rdi_cached(wdb, fm_cache, derotate=False, correct_distortion=False, colla
                                   reduc_label=f'FM {wdb.reduc_label}', save_products=False)
 
 
-def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=False, ring_model='2PowerLaws', ref_ring=1,
-                              eps=2.0, fit_eps=False):
+def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=False, ring_model='2PowerLaws', ref_ring=1):
     """
     Converts the parameter vector used by lnprob_Nrings into a dictionary of disk parameters. Returns (pdict, Nrings).
 
     Parameter order: [flux, pa, incl, g1, (g2, wg1 if backscattering)], then for each ring i = 1..N in order of
     increasing radius: [F_i, r0_i, <ring params>_i], except for the reference ring (ref_ring), whose F is fixed to 1
-    and is therefore left out: [r0_ref, <ring params>_ref]. <ring params> are (ain, aout) for ring_model='2PowerLaws'
-    or (fwhm,) for ring_model='Gaussian'. With ref_ring=1 (default) the order is
+    and is therefore left out: [r0_ref, <ring params>_ref]. <ring params> are (ain, aout) for ring_model='2PowerLaws',
+    (ain, aout, eps) for ring_model='2PowerLawsEps' or (fwhm,) for ring_model='Gaussian'. With ref_ring=1 (default) the order is
     [..., r0_1, <ring params>_1, F_2, r0_2, <ring params>_2, F_3, ...].
 
     For ring_model='TanhGaps' (a single power-law disk with tanh edges and Gaussian gaps, see tanh_gaps_profile),
     the shared parameters are followed by [rmin, rmax, lin, lout, gamma_sd] and then [r_gapk, fwhm_gapk, d_gapk] for
     each gap k = 1..Ngaps (ref_ring is ignored). Returns (pdict, Ngaps).
-
-    eps and fit_eps (ring_model='2PowerLaws' only) set the smoothing exponent of the two power laws, shared by all
-    rings (see grater_2hg_disk_model). If fit_eps is False (default), eps is fixed to the given value like h0 and
-    gamma, and only added to pdict if eps != 2 (so that the default model is exactly the GRaTer one). If fit_eps is
-    True, eps is read from the parameter vector, right after the shared parameters:
-    [flux, pa, incl, g1, (g2, wg1 if backscattering), eps], then the rings as above.
     """
     Fi, pai, incli, g1i = parameters[0:4]
     if backscattering:
@@ -732,12 +717,6 @@ def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=Fal
         g2i = 0
         wg1i = 1.0
         Nshared = 4
-
-    if ring_model != '2PowerLaws' and (fit_eps or eps != 2):
-        raise ValueError(f"eps (power-law smoothing) only applies to ring_model='2PowerLaws', not '{ring_model}'.")
-    if fit_eps:
-        eps = parameters[Nshared]
-        Nshared += 1
 
     if ring_model == 'TanhGaps':
         # a single disk [rmin, rmax, lin, lout, gamma_sd] followed by [r_gapk, fwhm_gapk, d_gapk] for each gap
@@ -758,12 +737,10 @@ def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=Fal
             j += len(gap_keys)
         return pdict, Ngaps
 
-    if ring_model == '2PowerLaws':
-        ring_keys = ['ain', 'aout']
-    elif ring_model == 'Gaussian':
-        ring_keys = ['fwhm']
-    else:
-        raise ValueError(f"Unknown ring_model '{ring_model}'; use '2PowerLaws', 'Gaussian' or 'TanhGaps'.")
+    ring_keys_by_model = {'2PowerLaws': ['ain', 'aout'], '2PowerLawsEps': ['ain', 'aout', 'eps'], 'Gaussian': ['fwhm']}
+    if ring_model not in ring_keys_by_model:
+        raise ValueError(f"Unknown ring_model '{ring_model}'; use {', '.join(map(repr, ring_keys_by_model))} or 'TanhGaps'.")
+    ring_keys = ring_keys_by_model[ring_model]
 
     # N rings take N*(1+len(ring_keys)) + (N-1) parameters (every ring but the reference one has an F)
     Nrings = (len(parameters) - Nshared + 1) / (2 + len(ring_keys))
@@ -776,8 +753,6 @@ def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=Fal
 
     pdict = {'flux': Fi, 'pa': pai, 'incl': incli, 'h0': h0, 'gamma': gamma,
              'g1': g1i, 'g2': g2i, 'wg1': wg1i}
-    if fit_eps or eps != 2:
-        pdict['eps'] = eps # otherwise left out, so the model is exactly the GRaTer one
     j = Nshared
     for i in range(1, Nrings+1):
         keys = ['r0']+ring_keys if i == ref_ring else ['F', 'r0']+ring_keys
@@ -917,12 +892,12 @@ def obj_fn(p, rdi_reduc, wdb, roi, distance, err_weighting=False, err_map=None, 
         If p contains 'flux' (total disk flux in mJy), the raw model is normalized to that flux (as in lnprob_Nrings)
         and the flux is fitted like any other parameter; the least-squares rescaling (lsq_sfac) is then not used
         and sfac = 1. The F_i of the rings then only set their relative fluxes, so one of them must be fixed.
-        If p contains 'eps' (shared by all rings, e.g. p.add('eps', 2., min=0.5, max=20.)) or 'eps_i' (per ring),
-        it sets the smoothing exponent of the two power laws (ring_model='2PowerLaws' only, must be > 0, see
-        grater_2hg_disk_model). Without it, eps = 2, i.e. the GRaTer model.
+        With ring_model='2PowerLawsEps', p can also contain eps_i (e.g. p.add('eps_1', 2., min=0.5, max=20.)), the
+        smoothing exponent of the two power laws of ring i (must be > 0, see grater_2hg_disk_model). A ring without
+        eps_i uses eps = 2, i.e. the GRaTer model.
 
     ring_model: str
-        Radial profile of each ring: '2PowerLaws' or 'Gaussian'. See grater_nring_2hg_disk_model.
+        Radial profile of each ring: '2PowerLaws', '2PowerLawsEps' or 'Gaussian'. See grater_nring_2hg_disk_model.
 
     fm_cache: dict or None
         If given (fm_cache = precompute_fm_rdi(wdb), computed for the current crop, zones and RDI presets of wdb), the
