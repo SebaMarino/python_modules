@@ -1,6 +1,6 @@
 import json
 import numpy as np
-from scipy import linalg
+from scipy.special import gammaln
 
 
 from winnie.plot import animate_quick_implot, quick_implot, mpl, plt
@@ -41,7 +41,8 @@ class DustEllipticalDistribution2PowerLawsEps(DustEllipticalDistribution2PowerLa
         rho_mid(a_eff) = dens_at_r0 * [2 / ((a_eff/r0)^(-eps*ain) + (a_eff/r0)^(-eps*aout))]^(1/eps)
     eps = 2 is VIP's (GRaTer's, Augereau et al. 1999) prescription. A larger eps gives a sharper turnover between
     the two slopes (a broken power law for eps -> inf), a smaller one a broader, rounder peak; the slopes far from
-    r0 are ain and aout for any eps. The vertical profile is VIP's: exp(-(|z|/H)^gamma), with H = ksi0*(a_eff/r0)^beta.
+    r0 are ain and aout for any eps. The vertical profile is VIP's: exp(-(|z|/H)^gamma), with H = ksi0*(a_eff/r0)^beta
+    (ksi0 is VIP's scale height, not the standard deviation; see vip_scale_height).
 
     Everything else (rmax, zmax, e, amin, itiltthreshold) is VIP's. rmax only depends on aout, which sets the
     slope at large radii for any eps. Note that VIP's print_info still computes the ring FWHM with eps = 2.
@@ -73,16 +74,167 @@ class DustEllipticalDistribution2PowerLawsEps(DustEllipticalDistribution2PowerLa
         return radial_density_term*vertical_density_term
 
 
+def vip_scale_height(sigma_z, gamma=2.):
+    """
+    Converts a vertical standard deviation sigma_z into the scale height ksi of VIP's vertical profile
+    exp(-(|z|/ksi)^gamma), whose standard deviation is ksi*sqrt(Gamma(3/gamma)/Gamma(1/gamma)).
+    For gamma = 2 (Gaussian), ksi = sqrt(2)*sigma_z.
+
+    Our model functions take h0 = sigma_z/r (at the reference radius) and pass ksi0 = vip_scale_height(h0*r_ref, gamma)
+    to the density classes, so H(r) = h0*r is the vertical standard deviation of the dust density for any gamma.
+    """
+    return sigma_z*np.exp(0.5*(gammaln(1./gamma) - gammaln(3./gamma)))
+
+
+def _set_zmax_nsigma(dist, zmax_nsigma, sigma_ref, r_ref, r_z):
+    """
+    Sets the integration height of the density object 'dist' to zmax_nsigma vertical standard deviations at radius r_z
+    (sigma_ref: standard deviation at r_ref, flaring as (r/r_ref)^beta). Does nothing if zmax_nsigma is None (then
+    zmax is set by the density's 'accuracy', as in VIP).
+    """
+    if zmax_nsigma is None:
+        return
+    dist.zmax = zmax_nsigma*sigma_ref*(r_z/r_ref)**dist.beta
+    dist.itiltthreshold = np.rad2deg(np.arctan(dist.rmax/dist.zmax))
+
+
+## Ray tracing with a line-of-sight range adapted to the flared disk (alternative to VIP's compute_scattered_light)
+# VIP integrates every line of sight over the same range of heights, |z| <= 2*zmax, where zmax is the height at which
+# the density drops below 'accuracy' at a single reference radius, and spaces the nodes geometrically towards the
+# midplane. With linear flaring the disk is much thinner than that at small radii (H proportional to r), so few slices badly
+# overestimate the column density there. compute_scattered_light_wedge instead integrates each line of sight only
+# where it is inside the flared disk, |z| <= c*r with c = zmax/r_ref, i.e. the same accuracy level at every radius.
+# The limits are where the ray itself crosses that envelope, so a ray passing close to the star in projection but
+# through high-altitude material at large radii (inclined disks) is still integrated over all of it.
+
+def _wedge_slope(dist):
+    """
+    Slope c of the envelope |z| <= c*r outside which the density of 'dist' is below its 'accuracy', for linear
+    flaring (beta = 1). All our density classes use H = ksi0*a_eff/r_ref with a_eff <= r/(1-e), and set zmax at a
+    radius r_z: VIP's 2PowerLaws (and 2PowerLawsEps) at a, the Gaussian and TanhGaps ones at their outer edge amax.
+    """
+    r_z = dist.amax if hasattr(dist, 'amax') else dist.a
+    return dist.zmax/(r_z*(1.-dist.e))
+
+
+def compute_scattered_light_wedge(vip_disk, halfNbSlices=25, lwidth=None):
+    """
+    Equivalent of vip_disk.compute_scattered_light(halfNbSlices) (vip_disk: VIP ScatteredLightDisk) in which each line
+    of sight is integrated over the section inside the flared disk, |z| <= c*r (see _wedge_slope), instead of
+    VIP's fixed |z| <= 2*zmax for every pixel. Requires linear flaring (beta = 1).
+
+    For each pixel, the line of sight l (as in VIP: l = 0 at the sky plane through the star) crosses the midplane at
+    lz0 and is inside the envelope for l1 <= l <= l2:
+      - if tan(incl) < 1/c (the line of sight is steeper than the disk surface), [l1, l2] is the single interval
+        between the two crossings of the envelope;
+      - otherwise (very inclined disks) the ray can leave the envelope and re-enter it at larger radii, so the
+        whole ray within r <= rmax is integrated.
+    [l1, l2] is also limited to r <= rmax. The 2*halfNbSlices-1 nodes are placed on either side of lz0 and the
+    integral is a trapezoidal sum, as in VIP.
+
+    lwidth: node spacing. 0 spaces the nodes uniformly on each side of lz0; lwidth > 0 spaces them geometrically
+        towards lz0 as VIP does (VIP uses lwidth = 100). None (default): 0 if c*tan(incl) < 0.5, else 10 (the rays then
+        graze the disk, their range is long compared with the disk thickness, and the density is concentrated near
+        the midplane crossing).
+        Tests on a 3-ring model (h0 = 0.05, rings at 32, 47 and 70 au) gave maximum errors with halfNbSlices = 4 of
+        4e-4 of the peak at incl = 19 deg, 1e-2 at 60 deg and 5e-2 at 80 deg (VIP's sampling: 0.12, 0.11 and 0.14).
+    """
+    d = vip_disk
+    dist = d.dust_density.dust_distribution_calc
+    if getattr(dist, 'beta', 1.) != 1.:
+        raise NotImplementedError("compute_scattered_light_wedge needs linear flaring (beta = 1); "
+                                  "use ray_sampling='vip' for other beta.")
+    d.check_inclination()
+    c = _wedge_slope(dist)
+    cosi, sini = d.cosi, d.sini
+
+    # same pixel selection as VIP
+    rho2_map = d.x_map**2 + d.y_map**2
+    valid = (dist.rmax**2 - rho2_map > 0.) * (rho2_map - d.rmin**2 > 0.)
+    x = d.x_map[valid]
+    y = d.y_map[valid]
+    ycs = cosi*y # y_disk = ycs + sini*l
+    zsn = -sini*y # z_disk = zsn + cosi*l
+    lz0 = y*np.tan(np.deg2rad(d.itilt)) # midplane crossing
+
+    # limit r <= rmax (cylinder around the star; padded by the disk offset)
+    rcyl = dist.rmax + np.hypot(d.xdo, d.ydo)
+    if sini > 1e-12:
+        half = np.sqrt(np.maximum(rcyl**2 - x**2, 0.))
+        lc1, lc2 = (-ycs-half)/sini, (-ycs+half)/sini
+    else:
+        lc1, lc2 = np.full_like(x, -np.inf), np.full_like(x, np.inf)
+
+    # envelope: (zsn + cosi*l)^2 <= c^2*((x-xdo)^2 + (ycs + sini*l - ydo)^2), i.e. A*l^2 + B*l + C <= 0
+    A = cosi**2 - c**2*sini**2
+    if A > 0:
+        B = 2.*(zsn*cosi - c**2*sini*(ycs-d.ydo))
+        C = zsn**2 - c**2*((x-d.xdo)**2 + (ycs-d.ydo)**2)
+        sq = np.sqrt(np.maximum(B**2 - 4.*A*C, 0.))
+        l1 = np.maximum((-B-sq)/(2.*A), lc1)
+        l2 = np.minimum((-B+sq)/(2.*A), lc2)
+    else:
+        l1, l2 = lc1, lc2
+    l2 = np.maximum(l2, l1)
+    if lwidth is None:
+        lwidth = 0. if c*np.tan(np.deg2rad(d.itilt)) < 0.5 else 10.
+    lc = np.clip(lz0, l1, l2) # nodes are centred on the midplane crossing (if inside the limits)
+
+    if lwidth > 0:
+        tmp = (np.exp(np.arange(halfNbSlices)*np.log(lwidth+1.)/(halfNbSlices-1.))-1.)/lwidth
+    else:
+        tmp = np.linspace(0., 1., halfNbSlices)
+    s_nodes = np.concatenate((-tmp[:0:-1], tmp)) # -1 ... 1
+
+    acc = np.zeros_like(x)
+    l_prev = f_prev = None
+    for s in s_nodes:
+        l = lc + s*((l2-lc) if s >= 0 else (lc-l1))
+        yd = ycs + sini*l
+        zd = zsn + cosi*l
+        d2star = x**2 + yd**2 + zd**2
+        dstar = np.sqrt(d2star)
+        rstar = np.sqrt(x**2 + yd**2)
+        thetastar = np.arctan2(yd, x)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            cosphi = (rstar*sini*np.sin(thetastar) + zd*cosi)/dstar
+            r = np.sqrt((x-d.xdo)**2 + (yd-d.ydo)**2)
+            theta = np.arctan2(yd-d.ydo, x-d.xdo)
+            rho = d.dust_density.density_cylindrical(r, np.cos(theta-np.deg2rad(d.omega)), zd)
+            f = rho*d.phase_function.compute_phase_function_from_cosphi(cosphi)/d2star
+        f = np.nan_to_num(f, nan=0., posinf=0., neginf=0.)
+        if l_prev is not None:
+            acc += (l-l_prev)*(f+f_prev)/2.
+        l_prev, f_prev = l, f
+
+    d.scattered_light_map.fill(0.)
+    d.scattered_light_map[valid] = acc*d.pxInAU**2
+    if d.flux_max is not None:
+        d.scattered_light_map *= d.flux_max/np.nanmax(d.scattered_light_map)
+    return d.scattered_light_map
+
+
+def _compute_scattered_light(vip_disk, halfNbSlices, ray_sampling='wedge', ray_lwidth=None):
+    """Runs VIP's ray tracing (ray_sampling='vip') or compute_scattered_light_wedge (ray_sampling='wedge')."""
+    if ray_sampling == 'vip':
+        return vip_disk.compute_scattered_light(halfNbSlices=halfNbSlices)
+    elif ray_sampling == 'wedge':
+        return compute_scattered_light_wedge(vip_disk, halfNbSlices=halfNbSlices, lwidth=ray_lwidth)
+    raise ValueError(f"Unknown ray_sampling '{ray_sampling}'; use 'vip' or 'wedge'.")
+
+
 def grater_2hg_disk_model(r0, h0, ain, aout, pa, incl, g1, g2, wg1,
                           e=0., omega=0., gamma=2., beta=1., xdo=0, ydo=0,
                           cent=np.array([160.,160.]), distance=10., nx=320, ny=320,
                           pxscale=0.063*u.arcsec/u.pixel, accuracy=None, rmax_accuracy=None,
-                          halfNbSlices=25, polar=False, flux_max=1.0, eps=2.):
+                          halfNbSlices=25, polar=False, flux_max=1.0, eps=2., ray_sampling='wedge', ray_lwidth=None,
+                          zmax_nsigma=3.):
     """
     A simple ring-like disk morphology based on Augereau et al. (1999) and assuming a linear combo of two H-G SPFs as the scattering phase function.
 
     r0: fiducial radius in au
-    h0: technically h0/r0 — the ratio of scale height to fiducial radius at the fiducial radius
+    h0: aspect ratio sigma_z/r at r0, where sigma_z is the vertical standard deviation of the dust density (for any
+        gamma; VIP's own scale height is ksi0 = vip_scale_height(h0*r0, gamma), i.e. sqrt(2)*h0*r0 for gamma = 2)
     ain: radial density power law exponent interior to r0
     aout: radial density power law exponent exterior to r0
     pa: disk position angle in degrees
@@ -106,6 +258,15 @@ def grater_2hg_disk_model(r0, h0, ain, aout, pa, incl, g1, g2, wg1,
     accuracy: the numerical accuracy for the model; pixels with density below this value will be set to zero
     rmax_accuracy: if accuracy is None, the model's accuracy is set such that non-zero values are achieved to this separation (in au)
     halfNbSlices: the number of planar slices to compute above and below the disk midplane
+    ray_sampling: 'wedge' (default) uses compute_scattered_light_wedge, which integrates each line of sight only where
+        it is inside the flared disk (|z| <= zmax*r/r0), so the sampling follows the local scale height (needs
+        beta = 1); 'vip' uses VIP's ray tracing, which integrates every line of sight over the same heights |z| <= 2*zmax
+    ray_lwidth: node spacing for ray_sampling='wedge' (None: automatic; 0: uniform; > 0: geometric towards the midplane,
+        as VIP with 100); see compute_scattered_light_wedge
+    zmax_nsigma: the maximum height of the integration, zmax, in vertical standard deviations at r0 (default 3). With
+        ray_sampling='wedge', each line of sight is integrated over |z| <= zmax_nsigma*H(r) at every radius (for a
+        Gaussian vertical profile, 3 sigma leaves out 0.27% of the column); with ray_sampling='vip' over a slab
+        |z| <= 2*zmax. None: zmax is set by accuracy, as in VIP (zmax = ksi0*(-ln(accuracy))^(1/gamma))
     polar: if True, a simple bell-shaped polarization curve is used to generate a polarized intensity image
     flux_max: if not None, normalize the model image so that this is the maximum value.
     """
@@ -125,7 +286,7 @@ def grater_2hg_disk_model(r0, h0, ain, aout, pa, incl, g1, g2, wg1,
         accuracy = (rmax_accuracy/r0)**(aout)
 
     spf = {'name':'DoubleHG', 'g': [g1, g2], 'weight': wg1, 'polar': polar}
-    dens = {'name': '2PowerLaws', 'ain': ain, 'aout': aout, 'a': r0, 'ksi0':h0*r0,
+    dens = {'name': '2PowerLaws', 'ain': ain, 'aout': aout, 'a': r0, 'ksi0': vip_scale_height(h0*r0, gamma),
             'e': e, 'gamma': gamma, 'beta': beta, 'accuracy': accuracy}
 
     vip_disk = ScatteredLightDisk(nx=nx, ny=ny, distance=distance,
@@ -140,8 +301,9 @@ def grater_2hg_disk_model(r0, h0, ain, aout, pa, incl, g1, g2, wg1,
         # keep VIP's density object (rmax, zmax, e, amin) and only replace its radial profile by the eps one
         vip_disk.dust_density.dust_distribution_calc.__class__ = DustEllipticalDistribution2PowerLawsEps
         vip_disk.dust_density.dust_distribution_calc.set_eps(eps)
+    _set_zmax_nsigma(vip_disk.dust_density.dust_distribution_calc, zmax_nsigma, h0*r0, r0, r0)
     vip_disk.check_inclination = dont_actually_check_inclination
-    disk = vip_disk.compute_scattered_light(halfNbSlices=halfNbSlices)
+    disk = _compute_scattered_light(vip_disk, halfNbSlices, ray_sampling=ray_sampling, ray_lwidth=ray_lwidth)
     return fix_star_cross(disk, cent)
 
 
@@ -153,7 +315,7 @@ class DustEllipticalDistributionGaussian:
 
     The radial profile is a Gaussian in semi-major axis, a_eff = r*(1-e*cos(theta))/(1-e^2), centred on r0
     with the given FWHM. The vertical profile is the same as VIP's: exp(-(|z|/H)^gamma), with
-    H = ksi0*(a_eff/r0)^beta.
+    H = ksi0*(a_eff/r0)^beta (ksi0 is VIP's scale height, not the standard deviation; see vip_scale_height).
 
     If surface_density is True (default), the Gaussian describes the surface density, i.e. the midplane
     density is divided by H(r)/ksi0 so that Sigma(r) ∝ rho_mid(r)*H(r) is Gaussian. If False, the
@@ -216,15 +378,18 @@ def grater_gauss_2hg_disk_model(r0, fwhm, h0, pa, incl, g1, g2, wg1,
                                 e=0., omega=0., gamma=2., beta=1., xdo=0, ydo=0,
                                 cent=np.array([160.,160.]), distance=10., nx=320, ny=320,
                                 pxscale=0.063*u.arcsec/u.pixel, accuracy=None, rmax_accuracy=None,
-                                halfNbSlices=25, polar=False, flux_max=1.0, surface_density=True):
+                                halfNbSlices=25, polar=False, flux_max=1.0, surface_density=True,
+                                ray_sampling='wedge', ray_lwidth=None, zmax_nsigma=3.):
     """
     Same as grater_2hg_disk_model, but with a Gaussian radial density profile instead of two power laws.
 
     r0: ring centre (semi-major axis) in au
     fwhm: ring full width at half maximum in au
-    h0: technically h0/r0 — the ratio of scale height to radius at r0
+    h0: aspect ratio sigma_z/r at r0 (sigma_z: vertical standard deviation, see grater_2hg_disk_model)
     surface_density: if True, the surface density is Gaussian; if False, the midplane volume density is Gaussian
     accuracy: the density is truncated where the Gaussian drops below this fraction of its peak (default 1e-3, i.e. ~3.7 sigma)
+    zmax_nsigma: maximum integration height in vertical standard deviations (here at the outer edge of the ring); see
+        grater_2hg_disk_model
     rmax_accuracy: if not None, the integration is additionally truncated at this separation (in au)
 
     All other parameters as in grater_2hg_disk_model.
@@ -233,7 +398,7 @@ def grater_gauss_2hg_disk_model(r0, fwhm, h0, pa, incl, g1, g2, wg1,
         accuracy = 1e-3
 
     spf = {'name':'DoubleHG', 'g': [g1, g2], 'weight': wg1, 'polar': polar}
-    dens = {'a': r0, 'fwhm': fwhm, 'ksi0': h0*r0, 'e': e, 'gamma': gamma, 'beta': beta,
+    dens = {'a': r0, 'fwhm': fwhm, 'ksi0': vip_scale_height(h0*r0, gamma), 'e': e, 'gamma': gamma, 'beta': beta,
             'surface_density': surface_density}
 
     # VIP only implements '2PowerLaws', so build the disk with a placeholder density and swap in the Gaussian one
@@ -244,13 +409,14 @@ def grater_gauss_2hg_disk_model(r0, fwhm, h0, pa, incl, g1, g2, wg1,
                                   xs=cent[0], ys=cent[1])
 
     gauss_dens = DustEllipticalDistributionGaussian(accuracy, dens)
+    _set_zmax_nsigma(gauss_dens, zmax_nsigma, h0*r0, r0, gauss_dens.amax) # at the outer edge, as with accuracy
     if rmax_accuracy is not None:
         gauss_dens.rmax = min(gauss_dens.rmax, rmax_accuracy)
     vip_disk.dust_density.accuracy = accuracy
     vip_disk.dust_density.type = 'Gaussian'
     vip_disk.dust_density.dust_distribution_calc = gauss_dens
     vip_disk.check_inclination = lambda: None # see dont_actually_check_inclination in grater_2hg_disk_model
-    disk = vip_disk.compute_scattered_light(halfNbSlices=halfNbSlices)
+    disk = _compute_scattered_light(vip_disk, halfNbSlices, ray_sampling=ray_sampling, ray_lwidth=ray_lwidth)
     return fix_star_cross(disk, cent)
 
 
@@ -285,7 +451,8 @@ class DustEllipticalDistributionTanhGaps:
     replacement for VIP's DustEllipticalDistribution2PowerLaws (as DustEllipticalDistributionGaussian).
 
     The radial profile is evaluated at the semi-major axis a_eff = r*(1-e*cos(theta))/(1-e^2). The vertical profile
-    is exp(-(|z|/H)^gamma), with H = ksi0*(a_eff/rmin)^beta (ksi0 is the scale height at rmin).
+    is exp(-(|z|/H)^gamma), with H = ksi0*(a_eff/rmin)^beta (ksi0 is VIP's scale height at rmin, not the standard
+    deviation; see vip_scale_height).
     If surface_density is True (default), the profile describes the surface density (the midplane density is divided
     by H/ksi0); if False, it describes the midplane volume density.
     """
@@ -353,15 +520,18 @@ def grater_tanhgaps_2hg_disk_model(rmin, rmax, lin, lout, gamma_sd, h0, pa, incl
                                    cent=np.array([160.,160.]), distance=10., nx=320, ny=320,
                                    pxscale=0.063*u.arcsec/u.pixel, accuracy=None, rmax_accuracy=None,
                                    halfNbSlices=25, polar=False, flux_max=1.0, surface_density=True,
+                                   ray_sampling='wedge', ray_lwidth=None, zmax_nsigma=3.,
                                    **gap_params):
     """
     Same as grater_2hg_disk_model, but with the radial profile of tanh_gaps_profile: a power law (exponent
     gamma_sd) between rmin and rmax with tanh edges of widths lin and lout (all in au), multiplied by Gaussian gaps.
 
     gap_params: r_gap1, fwhm_gap1, d_gap1, r_gap2, ... (centre and FWHM in au, fractional depth 0-1) for each gap.
-    h0: ratio of scale height to radius at rmin
+    h0: aspect ratio sigma_z/r at rmin (sigma_z: vertical standard deviation, see grater_2hg_disk_model)
     surface_density: if True, the profile is the surface density; if False, the midplane volume density
     accuracy: the density is truncated where the edges drop below this fraction (default 1e-3)
+    zmax_nsigma: maximum integration height in vertical standard deviations (here at the outer edge); see
+        grater_2hg_disk_model
     rmax_accuracy: if not None, the integration is additionally truncated at this separation (in au)
 
     All other parameters as in grater_2hg_disk_model.
@@ -371,7 +541,7 @@ def grater_tanhgaps_2hg_disk_model(rmin, rmax, lin, lout, gamma_sd, h0, pa, incl
 
     spf = {'name':'DoubleHG', 'g': [g1, g2], 'weight': wg1, 'polar': polar}
     dens = {'rmin': rmin, 'rmax': rmax, 'lin': lin, 'lout': lout, 'gamma_sd': gamma_sd,
-            'gaps': gap_params_to_list(gap_params), 'ksi0': h0*rmin, 'e': e, 'gamma': gamma, 'beta': beta,
+            'gaps': gap_params_to_list(gap_params), 'ksi0': vip_scale_height(h0*rmin, gamma), 'e': e, 'gamma': gamma, 'beta': beta,
             'surface_density': surface_density}
 
     # VIP only implements '2PowerLaws', so build the disk with a placeholder density and swap in ours
@@ -382,13 +552,14 @@ def grater_tanhgaps_2hg_disk_model(rmin, rmax, lin, lout, gamma_sd, h0, pa, incl
                                   xs=cent[0], ys=cent[1])
 
     tanh_dens = DustEllipticalDistributionTanhGaps(accuracy, dens)
+    _set_zmax_nsigma(tanh_dens, zmax_nsigma, h0*rmin, rmin, tanh_dens.amax) # at the outer edge, as with accuracy
     if rmax_accuracy is not None:
         tanh_dens.rmax = min(tanh_dens.rmax, rmax_accuracy)
     vip_disk.dust_density.accuracy = accuracy
     vip_disk.dust_density.type = 'TanhGaps'
     vip_disk.dust_density.dust_distribution_calc = tanh_dens
     vip_disk.check_inclination = lambda: None # see dont_actually_check_inclination in grater_2hg_disk_model
-    disk = vip_disk.compute_scattered_light(halfNbSlices=halfNbSlices)
+    disk = _compute_scattered_light(vip_disk, halfNbSlices, ray_sampling=ray_sampling, ray_lwidth=ray_lwidth)
     return fix_star_cross(disk, cent)
 
 
@@ -418,11 +589,13 @@ def grater_nring_2hg_disk_model(cent=np.array([160.,160.]),
                                  distance=10., nx=320, ny=320,
                                  pxscale=0.063*u.arcsec/u.pixel, accuracy=None, rmax_accuracy=None,
                                  polar=False, halfNbSlices=25, shared_params=None, ring_model='2PowerLaws',
+                                 ray_sampling='wedge', ray_lwidth=None, zmax_nsigma=3.,
                                  **disk_params):
     """
     ring_model: '2PowerLaws' (each ring needs r0_i, ain_i, aout_i), '2PowerLawsEps' (same, plus the smoothing
         exponent of the two power laws eps_i, see grater_2hg_disk_model; a ring with no eps_i uses eps = 2, i.e.
         the GRaTer model) or 'Gaussian' (each ring needs r0_i, fwhm_i).
+    ray_sampling, ray_lwidth, zmax_nsigma: see grater_2hg_disk_model.
     """
     if ring_model in ('2PowerLaws', '2PowerLawsEps'):
         ring_fn = grater_2hg_disk_model
@@ -459,13 +632,16 @@ def grater_nring_2hg_disk_model(cent=np.array([160.,160.]),
                                                             distance=distance, nx=nx, ny=ny,
                                                             pxscale=pxscale, accuracy=accuracy, 
                                                             rmax_accuracy=rmax_accuracy,
-                                                            polar=polar, halfNbSlices=halfNbSlices, flux_max=1.0 )
+                                                            polar=polar, halfNbSlices=halfNbSlices, flux_max=1.0,
+                                                            ray_sampling=ray_sampling, ray_lwidth=ray_lwidth,
+                                                            zmax_nsigma=zmax_nsigma)
         i+=1
     return composite_image
 
 
 
-def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, h0=0.05, gamma=2.0, err=None, wdb=None, shared_params=None, prior_ranges=None, halfNbSlices=2, return_soln=False, plot_model=False, print_chisq=False, backscattering=False, ring_model='2PowerLaws', fm_cache=None, ref_ring=1):
+def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, h0=0.05, gamma=2.0, err=None, wdb=None, shared_params=None, prior_ranges=None, halfNbSlices=4, return_soln=False, plot_model=False, print_chisq=False, backscattering=False, ring_model='2PowerLaws', ref_ring=1,
+                  ray_sampling='wedge', zmax_nsigma=3.):
     """
     parameters: [F, pa, incl, g1, (g2, wg1 if backscattering)], then for each ring i: [F_i, r0_i, <ring params>_i],
         except the reference ring (ref_ring, default 1), whose F is fixed to 1 and left out: [r0_ref, <ring params>_ref].
@@ -477,15 +653,18 @@ def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, 
     ref_ring: int
         The ring used as flux reference (F=1); the other rings' F are relative to it. Default 1.
 
+    halfNbSlices, ray_sampling, zmax_nsigma: ray tracing of the raw model, see grater_2hg_disk_model. With the default
+        ray_sampling='wedge' and zmax_nsigma=3, halfNbSlices=4 gives errors of ~1e-3 of the peak for low inclinations.
+
     ring_model: str
         '2PowerLaws', '2PowerLawsEps', 'Gaussian' or 'TanhGaps'. With '2PowerLawsEps', each ring also has its own
         smoothing exponent eps_i of the two power laws (see grater_2hg_disk_model; eps = 2 is '2PowerLaws'). Set its
         prior with prior_ranges, e.g. {'eps_1': (0.5, 20.)}; eps_i <= 0 always returns -inf.
 
-    fm_cache: dict or None
-        If given (fm_cache = precompute_fm_rdi(wdb), computed after setting the crop, zones and RDI presets used for
-        the fit), the forward-modeled RDI uses these precomputed reference-image quantities (fm_rdi_cached) instead of
-        wdb.run_rdi(forward_model=True), which is equivalent but faster. If None, wdb.run_rdi is used.
+    wdb: winnie SpaceRDI object
+        The forward-modeled RDI uses winnie's cached reference matrices (wdb._prepared_refmats), which a standard
+        (forward_model=False) wdb.run_rdi builds for the crop, zones and RDI presets current at that time. Run one
+        after changing any of these and before fitting (rdi_reduc is normally that run).
 
     raw_model:
         your idealized / unblurred disk model image oriented north-up.
@@ -497,8 +676,6 @@ def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, 
         the position where the star would be in the model image (zero indexed and as [x,y])
     """
     if wdb is None:
-        if fm_cache is not None:
-            raise ValueError("fm_cache was computed for a specific SpaceRDI object; pass that object as wdb.")
         import winnie
         wdb = winnie.SpaceRDI(from_fits=rdi_reduc.filename)
     # else:
@@ -541,12 +718,13 @@ def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, 
         raw_model = grater_tanhgaps_2hg_disk_model(**{k: v for k, v in pdict.items() if k != 'flux'},
                                                    cent=wdb.c_star, distance=distance,
                                                    nx=wdb.nx, ny=wdb.ny, pxscale=wdb.pxscale,
-                                                   rmax_accuracy=None, halfNbSlices=halfNbSlices)
+                                                   rmax_accuracy=None, halfNbSlices=halfNbSlices,
+                                                   ray_sampling=ray_sampling, zmax_nsigma=zmax_nsigma)
     else:
         raw_model = grater_nring_2hg_disk_model(**pdict, cent=wdb.c_star, distance=distance,
                                                 nx=wdb.nx, ny=wdb.ny, pxscale=wdb.pxscale,
                                                 rmax_accuracy=None, halfNbSlices=halfNbSlices, shared_params=shared_params,
-                                                ring_model=ring_model)
+                                                ring_model=ring_model, ray_sampling=ray_sampling, zmax_nsigma=zmax_nsigma)
     # normalize raw_model to have an integrated flux of F_i
     
     # print raw flux
@@ -563,11 +741,8 @@ def lnprob_Nrings(parameters, rdi_reduc, roi, distance, pix_sr, crop_size=None, 
     # Convolve the model using the prepared SpaceConvolution object then set it as the CSS model in the SpaceRDI object
     wdb.set_circumstellar_model(raw_model=raw_model, raw_model_pxscale=wdb.pxscale, raw_model_center=wdb.c_star)
 
-    # Run RDI on the model to get the forward-modeled result
-    if fm_cache is None:
-        fmrdi_reduc = wdb.run_rdi(forward_model=True, save_products=False, collapse_rolls=True, derotate=rdi_reduc.derotated, correct_distortion=rdi_reduc.distortion_corrected)
-    else:
-        fmrdi_reduc = fm_rdi_cached(wdb, fm_cache, collapse_rolls=True, derotate=rdi_reduc.derotated, correct_distortion=rdi_reduc.distortion_corrected)
+    # Run RDI on the model to get the forward-modeled result (uses winnie's cached reference matrices)
+    fmrdi_reduc = wdb.run_rdi(forward_model=True, save_products=False, collapse_rolls=True, derotate=rdi_reduc.derotated, correct_distortion=rdi_reduc.distortion_corrected)
 
 
     if plot_model:
@@ -618,81 +793,6 @@ def promote_spacerdi_to_float64(wdb):
         wdb.set_crop()
     else:
         wdb.set_crop(list(wdb.cropped_shape))
-
-
-## Faster forward-modeled RDI for repeated likelihood calls (e.g. MCMC)
-# In forward-model mode winnie computes, for each optimization zone, coefficients c = (R R^T)^-1 R m, where R holds the
-# reference images within the zone and m the convolved model, and then subtracts c . R_sub within the subtraction zone.
-# R, R R^T and its LU factorization do not depend on the model, so they can be computed once and reused for every call.
-
-def precompute_fm_rdi(wdb):
-    """
-    Precomputes the model-independent parts of forward-modeled RDI for the current crop, zones and RDI settings of
-    the winnie SpaceRDI object 'wdb'. The returned dictionary is used by fm_rdi_cached (via lnprob_Nrings / obj_fn with fm_cache=...), and must
-    be recomputed whenever the crop, zones or RDI presets of wdb change.
-
-    Only supports the settings that are valid for forward modeling without smoothing (e.g. rdi_presets);
-    raises a ValueError for HPFRDI (opt_smoothing_fn) or fixed coefficients (coeffs_in).
-    """
-    settings = {**wdb.rdi_settings}
-    for key in ['opt_smoothing_fn', 'coeffs_in', 'hcube_css']:
-        if settings.get(key, None) is not None:
-            raise ValueError(f"precompute_fm_rdi does not support the RDI setting '{key}'; use wdb.run_rdi(forward_model=True) instead.")
-    zero_nans = settings.get('zero_nans', False)
-    ref_mask = settings.get('ref_mask', None)
-
-    # always solve in float64: R R^T is too ill-conditioned for float32 (see promote_spacerdi_to_float64)
-    imcube_ref = np.asarray(wdb.imcube_ref, dtype=np.float64) # (nT_ref, ny, nx), cropped
-    nT_ref = imcube_ref.shape[0]
-    regions = []
-    for Ri, (opt_i, sub_i) in enumerate(zip(wdb.optzones, wdb.subzones)):
-        use = np.ones(nT_ref, dtype=bool) if ref_mask is None else np.asarray(ref_mask[Ri], dtype=bool)
-        refarrs = imcube_ref[:, opt_i]
-        if zero_nans:
-            refarrs = np.nan_to_num(refarrs)
-        refarrs = refarrs[use]
-        regions.append(dict(opt=opt_i.copy(),
-                            sub=sub_i.copy(),
-                            use=use,
-                            refarrs=refarrs, # (nT_ref_used, nP_opt)
-                            lu_piv=linalg.lu_factor(refarrs @ refarrs.T, check_finite=False),
-                            ref_sub=imcube_ref[:, sub_i].copy())) # (nT_ref, nP_sub), never zeroed (as in winnie's reconstruction)
-
-    return dict(regions=regions, zero_nans=zero_nans, crop_indices=tuple(wdb._crop_indices),
-                shape=imcube_ref.shape, optzones=wdb.optzones.copy(), subzones=wdb.subzones.copy())
-
-
-def fm_rdi_cached(wdb, fm_cache, derotate=False, correct_distortion=False, collapse_rolls=True):
-    """
-    Equivalent to wdb.run_rdi(forward_model=True, save_products=False, ...) for the circumstellar model currently set in
-    wdb (wdb.set_circumstellar_model), but using the reference-only quantities precomputed by precompute_fm_rdi.
-    Returns a winnie SpaceReduction object.
-    """
-    if (tuple(wdb._crop_indices) != fm_cache['crop_indices'] or wdb.imcube_ref.shape != fm_cache['shape']
-            or not np.array_equal(wdb.optzones, fm_cache['optzones']) or not np.array_equal(wdb.subzones, fm_cache['subzones'])):
-        raise ValueError("fm_cache does not match the current crop/zones of wdb; rerun precompute_fm_rdi(wdb).")
-    for key in ['opt_smoothing_fn', 'coeffs_in', 'hcube_css']:
-        if wdb.rdi_settings.get(key, None) is not None:
-            raise ValueError(f"The RDI presets of wdb now include '{key}' (e.g. HPFRDI or MCRDI), which fm_cache does not "
-                             "cover; switch back with wdb.rdi_presets(), or use wdb.run_rdi(forward_model=True).")
-    if wdb.imcube_css is None:
-        raise ValueError("Set a circumstellar model with wdb.set_circumstellar_model before calling fm_rdi_cached.")
-
-    hcube = np.asarray(wdb.imcube_css, dtype=np.float64) # (nT, ny, nx)
-    nT = hcube.shape[0]
-    psf_model = np.full(hcube.shape, np.nan, dtype=hcube.dtype)
-    for reg in fm_cache['regions']:
-        tararrs = hcube[:, reg['opt']]
-        if fm_cache['zero_nans']:
-            tararrs = np.nan_to_num(tararrs)
-        coeffs = np.zeros((nT, len(reg['use'])), dtype=hcube.dtype)
-        coeffs[:, reg['use']] = linalg.lu_solve(reg['lu_piv'], reg['refarrs'] @ tararrs.T, check_finite=False).T
-        psf_model[:, reg['sub']] = coeffs @ reg['ref_sub']
-
-    residuals = hcube - psf_model
-    return wdb.imcube_to_products(residuals, derotate=derotate, correct_distortion=correct_distortion,
-                                  collapse_rolls=collapse_rolls, output_ext=wdb.output_ext+'_fwdmod',
-                                  reduc_label=f'FM {wdb.reduc_label}', save_products=False)
 
 
 def nring_parameters_to_pdict(parameters, h0=0.05, gamma=2.0, backscattering=False, ring_model='2PowerLaws', ref_ring=1):
@@ -794,7 +894,7 @@ _parallel_state = {}
 def set_parallel_lnprob(**kwargs):
     """
     Stores the arguments of lnprob_Nrings (everything except 'parameters', given as keywords, e.g.
-    rdi_reduc=..., roi=..., distance=..., pix_sr=..., crop_size=..., wdb=..., fm_cache=..., ...) for use by
+    rdi_reduc=..., roi=..., distance=..., pix_sr=..., crop_size=..., wdb=..., ...) for use by
     lnprob_Nrings_parallel. Must be called before make_parallel_pool, since workers copy the state when created.
     """
     _parallel_state.clear()
@@ -882,7 +982,7 @@ def make_parallel_pool(processes=8, worker_ncores=1):
 def obj_fn(p, rdi_reduc, wdb, roi, distance, err_weighting=False, err_map=None, rmax_accuracy=None,
            halfNbSlices=25, return_soln=False, q_clip=None, lsq_sfac=True,
            count=True, store_samples=False, clear_each_call=True, shared_params=None, ring_model='2PowerLaws',
-           fm_cache=None):
+           ray_sampling='wedge', zmax_nsigma=3.):
     """
     Parameters
     ----------
@@ -898,11 +998,6 @@ def obj_fn(p, rdi_reduc, wdb, roi, distance, err_weighting=False, err_map=None, 
 
     ring_model: str
         Radial profile of each ring: '2PowerLaws', '2PowerLawsEps' or 'Gaussian'. See grater_nring_2hg_disk_model.
-
-    fm_cache: dict or None
-        If given (fm_cache = precompute_fm_rdi(wdb), computed for the current crop, zones and RDI presets of wdb), the
-        forward-modeled RDI uses these precomputed reference-image quantities (fm_rdi_cached) instead of
-        wdb.run_rdi(forward_model=True), which is equivalent but much faster. If None, wdb.run_rdi is used.
 
     rdi_reduc: winnie.space.SpaceReduction
         An RDI reduction of the data using the current settings in 'wdb', the Winnie SpaceRDI object.
@@ -939,6 +1034,9 @@ def obj_fn(p, rdi_reduc, wdb, roi, distance, err_weighting=False, err_map=None, 
     halfNbSlices: int
         The number of planar slices to compute above and below the disk midplane when generating the raw 
         disk model.
+
+    ray_sampling, zmax_nsigma: ray tracing of the raw model, see grater_2hg_disk_model (default 'wedge' and 3;
+        halfNbSlices=4 is then enough for low inclinations).
         
     return_soln: bool
         If True, rather than returning a residual array, returns the forward modeled image and some other items
@@ -1006,7 +1104,7 @@ def obj_fn(p, rdi_reduc, wdb, roi, distance, err_weighting=False, err_map=None, 
     raw_model = grater_nring_2hg_disk_model(**pdict, cent=wdb.c_star, distance=distance,
                                             nx=wdb.nx, ny=wdb.ny, pxscale=wdb.pxscale,
                                             rmax_accuracy=rmax_accuracy, halfNbSlices=halfNbSlices, shared_params=shared_params,
-                                            ring_model=ring_model)
+                                            ring_model=ring_model, ray_sampling=ray_sampling, zmax_nsigma=zmax_nsigma)
     if flux is not None:
         # normalize the raw model (MJy/sr) to an integrated flux of 'flux' mJy, as in lnprob_Nrings
         pix_sr = ((wdb.pxscale << u.rad/u.pixel).value)**2
@@ -1022,10 +1120,9 @@ def obj_fn(p, rdi_reduc, wdb, roi, distance, err_weighting=False, err_map=None, 
     # regardless of return_soln (tying it to return_soln left both im and rolls as None
     # whenever rdi_reduc.derotated is False, causing SpaceReduction to try loading a
     # nonexistent saved file instead of building the result in memory).
-    if fm_cache is None:
-        fmrdi_reduc = wdb.run_rdi(forward_model=True, save_products=False, collapse_rolls=True, derotate=rdi_reduc.derotated, correct_distortion=rdi_reduc.distortion_corrected)
-    else:
-        fmrdi_reduc = fm_rdi_cached(wdb, fm_cache, collapse_rolls=True, derotate=rdi_reduc.derotated, correct_distortion=rdi_reduc.distortion_corrected)
+    # The forward-modeled RDI uses winnie's cached reference matrices, built by the last standard (forward_model=False)
+    # wdb.run_rdi, so run one after changing the crop, zones or RDI presets of wdb.
+    fmrdi_reduc = wdb.run_rdi(forward_model=True, save_products=False, collapse_rolls=True, derotate=rdi_reduc.derotated, correct_distortion=rdi_reduc.distortion_corrected)
     model_cmp = fmrdi_reduc.im if rdi_reduc.derotated else fmrdi_reduc.rolls
 
     if lsq_sfac:
